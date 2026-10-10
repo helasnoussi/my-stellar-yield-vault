@@ -1,0 +1,21 @@
+# Rust / Cargo output
+/target/
+**/*.rs.bk
+
+# Cargo lockfile (optionnel, mais souvent exclu pour les librairies / contrats)
+# Cargo.lock
+
+# Environment & Storage overrides (ex: goinfre / XDG)
+.cache/
+.local/
+.config/
+
+# Stellar / Soroban local state & CLI data
+.soroban/
+.stellar/
+
+# System / OS specific files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

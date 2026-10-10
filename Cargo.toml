@@ -1,0 +1,19 @@
+[package]
+name = "yield_vault"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = "20.5.0" # Assurez-vous d'utiliser la version de SDK adaptée à votre environnement Soroban
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+panic = "abort"
+codegen-units = 1
+lto = true

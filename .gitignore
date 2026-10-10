@@ -1,0 +1,7 @@
+/target/
+.cache/
+.local/
+.config/
+.soroban/
+.stellar/
+.DS_Store
