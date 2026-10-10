@@ -37,6 +37,11 @@ stellar contract invoke \
   --from GBRHOUDYVMYERRSFYOELPSZMKSIAFAXHEGGGTLQ5YUZ7GXPQZ5I5R5WH \
   --amount 100
 
-📜 License
+```
+---
+
+## 📜 License
 
 This project is open-source and built for the Stellar/Soroban hackathon.
+
+
