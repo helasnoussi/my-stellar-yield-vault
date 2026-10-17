@@ -14,6 +14,7 @@ approved, never to an arbitrary address.
 - **Blend allocation:** the agent lends idle XLM to admin-approved Blend pools as a plain supply (no collateral, no borrowing, so no liquidation risk).
 - **Guardrails in the contract:** only the configured agent can allocate, only to approved pools, at most 100 XLM per operation.
 - **Yield measured, not just estimated:** the agent reports the pool's instant rate and the yield a Blend position actually earned over the last 7 days, and decides on the latter.
+- **Web app:** depositors connect Freighter, deposit and withdraw, and follow the funds lent on Blend, both yield figures and the agent's moves.
 - **Testnet verified:** deployed on Stellar Testnet, with unit tests and a test against a local copy of the real Blend testnet pool.
 
 ---
@@ -191,6 +192,40 @@ eval stellar contract invoke --id <CONTRACT_ID> --source-account <USER_ALIAS> $N
 eval stellar contract invoke --id <CONTRACT_ID> --source-account <USER_ALIAS> $NET \
   -- withdraw --to <USER_PUBLIC_KEY> --amount 500000000
 ```
+
+## Web app (`web/`)
+
+A React page for depositors: connect [Freighter](https://www.freighter.app) on
+Testnet, deposit and withdraw XLM, and follow the vault's total assets, the
+funds lent on Blend, both yield figures (computed with the same code as the
+agent, `src/blend-rates.ts`) and the last 3 days of vault activity. Reading
+works without a wallet.
+
+```bash
+npm run web:dev     # development server
+npm run web:build   # production build in dist-web/
+```
+
+`VITE_CONTRACT_ID` and `VITE_RPC_URL` override the deployed testnet vault and
+RPC endpoint.
+
+To deposit from the page, Freighter needs a funded Testnet account:
+
+1. Install the [Freighter](https://www.freighter.app) extension and create a
+   wallet, in the browser where you open the page.
+2. Select **Testnet** with the network (globe) button at the top of Freighter.
+3. Fund the account with **Friendbot** (10,000 test XLM), then click
+   **Connect Freighter** on the page.
+
+Use a regular account rather than the admin's: depositing and withdrawing need
+no special rights.
+
+## Built with
+
+Built with [Claude Code](https://claude.com/claude-code) and
+[Raven](https://raven.stellar.org), the Stellar ecosystem context server.
+Raven was used to pick Blend as the yield source, find its v2 contracts and
+interface, and review its risks (audits and the YieldBlox incident).
 
 ## License
 

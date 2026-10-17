@@ -10,3 +10,4 @@ dist/
 .env
 .agent-state.json
 agent.log
+dist-web/

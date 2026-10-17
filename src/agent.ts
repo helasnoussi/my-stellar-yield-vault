@@ -11,6 +11,18 @@ import {
 } from "@stellar/stellar-sdk";
 import * as dotenv from "dotenv";
 import { readFileSync, writeFileSync } from "node:fs";
+import {
+    estimateReserve,
+    formatDuration,
+    formatPercent,
+    formatXlm,
+    loadEventSamples,
+    measureRealizedYield,
+    mergeSamples,
+    type BlendReserve,
+    type RateSample,
+    type RealizedYield,
+} from "./blend-rates.js";
 
 dotenv.config();
 
@@ -52,25 +64,8 @@ if (!Number.isInteger(AGENT_INTERVAL_MS) || AGENT_INTERVAL_MS <= 0) {
 const botKeypair = Keypair.fromSecret(BOT_SECRET);
 const vault = new Contract(configuredContractId);
 
-// Blend v2 fixed-point scales (pool/src/constants.rs)
-const SCALAR_7 = 10_000_000;
-const SCALAR_12 = 1_000_000_000_000n;
-const SECONDS_PER_YEAR = 31_536_000;
-// Below this size, an event's b_tokens rounding makes its implied b_rate too noisy
-const MIN_EVENT_B_TOKENS = 1_000_000n;
-const MAX_EVENT_PAGES = 50;
-
 // Lock to prevent overlapping execution loops
 let isExecuting = false;
-
-// One observation of a pool's b_rate (value of one supplied b_token, 12 decimals)
-type RateSample = { time: number; bRate: bigint };
-
-type RealizedYield = {
-    periodReturn: number; // e.g. 0.035 for +3.5 % over the period
-    periodSeconds: number;
-    annualizedBps: number;
-};
 
 type PoolState = {
     id: number;
@@ -213,7 +208,7 @@ async function loadPools(token: string): Promise<PoolState[]> {
             simulate(pool, "get_reserve", addressArg(token)) as Promise<BlendReserve>,
             simulate(pool, "get_config") as Promise<{ bstop_rate: number }>,
             simulate(vault, "pool_assets", nativeToScVal(Number(id), { type: "u32" })),
-            loadEventSamples(address, token),
+            loadEventSamples(server, address, token, REALIZED_WINDOW_SECONDS),
         ]);
 
         // get_reserve accrues interest up to now, so (last_time, b_rate) is a current sample
@@ -225,7 +220,7 @@ async function loadPools(token: string): Promise<PoolState[]> {
         history[address] = samples;
 
         const estimate = estimateReserve(reserve, Number(config.bstop_rate));
-        const realized = measureRealizedYield(samples, current);
+        const realized = measureRealizedYield(samples, current, REALIZED_WINDOW_SECONDS, REALIZED_MIN_SECONDS);
         states.push({
             id: Number(id),
             address,
@@ -240,54 +235,6 @@ async function loadPools(token: string): Promise<PoolState[]> {
 
     saveHistory(history);
     return states;
-}
-
-// Realized yield: growth of the b_rate between the oldest sample in the window and now.
-// It is what suppliers actually earned over that period, not a projection.
-function measureRealizedYield(samples: RateSample[], current: RateSample): RealizedYield | undefined {
-    const start = samples.find((sample) => sample.time >= current.time - REALIZED_WINDOW_SECONDS);
-    if (!start) return undefined;
-    const periodSeconds = current.time - start.time;
-    if (periodSeconds < REALIZED_MIN_SECONDS) return undefined;
-
-    const periodReturn = Number(current.bRate) / Number(start.bRate) - 1;
-    return {
-        periodReturn,
-        periodSeconds,
-        annualizedBps: Math.round(periodReturn * (SECONDS_PER_YEAR / periodSeconds) * 10_000),
-    };
-}
-
-// Past b_rates implied by Blend's supply/withdraw events (tokens / b_tokens).
-// Stellar RPC keeps about 7 days of events.
-async function loadEventSamples(poolAddress: string, token: string): Promise<RateSample[]> {
-    const topics = ["supply", "withdraw"].map((name) => [
-        nativeToScVal(name, { type: "symbol" }).toXDR("base64"),
-        addressArg(token).toXDR("base64"),
-        "*",
-    ]);
-    const filters = [{ type: "contract" as const, contractIds: [poolAddress], topics }];
-    const samples: RateSample[] = [];
-
-    try {
-        const { oldestLedger } = await server.getHealth();
-        let page = await server.getEvents({ startLedger: oldestLedger + 1, filters, limit: 200 });
-        for (let i = 0; i < MAX_EVENT_PAGES; i++) {
-            for (const event of page.events) {
-                const [tokens, bTokens] = (scValToNative(event.value) as bigint[]).map(BigInt);
-                if (tokens === undefined || bTokens === undefined || bTokens < MIN_EVENT_B_TOKENS) continue;
-                samples.push({
-                    time: Math.floor(Date.parse(event.ledgerClosedAt) / 1000),
-                    bRate: (tokens * SCALAR_12) / bTokens,
-                });
-            }
-            if (page.events.length === 0 || page.latestLedger <= (page.events.at(-1)?.ledger ?? 0)) break;
-            page = await server.getEvents({ cursor: page.cursor, filters, limit: 200 });
-        }
-    } catch (error) {
-        console.warn(`⚠️ Could not read Blend events for ${poolAddress.slice(0, 8)}…:`, error);
-    }
-    return samples;
 }
 
 type History = Record<string, RateSample[]>;
@@ -317,84 +264,8 @@ function saveHistory(history: History) {
     writeFileSync(AGENT_STATE_FILE, JSON.stringify(serialized, null, 2));
 }
 
-// Sorted by time, one sample per second, limited to the last 30 days
-function mergeSamples(...lists: RateSample[][]): RateSample[] {
-    const byTime = new Map<number, RateSample>();
-    for (const sample of lists.flat()) byTime.set(sample.time, sample);
-    const newest = Math.max(...byTime.keys());
-    return [...byTime.values()]
-        .filter((sample) => sample.time >= newest - 30 * 24 * 3600)
-        .sort((a, b) => a.time - b.time);
-}
-
-type BlendReserve = {
-    config: {
-        enabled: boolean;
-        util: number;
-        r_base: number;
-        r_one: number;
-        r_two: number;
-        r_three: number;
-    };
-    data: {
-        b_rate: bigint;
-        b_supply: bigint;
-        d_rate: bigint;
-        d_supply: bigint;
-        ir_mod: bigint;
-        last_time: bigint;
-    };
-};
-
-// Instant supply rate from Blend v2's interest rate model (pool/src/pool/interest.rs),
-// annualized as if the pool's utilization and rate modifier stayed the same for a year.
-// It moves as soon as borrowers repay or suppliers arrive: an estimate, not a forecast.
-function estimateReserve(reserve: BlendReserve, bstopRate: number) {
-    const { config, data } = reserve;
-    const totalSupply = (BigInt(data.b_supply) * BigInt(data.b_rate)) / SCALAR_12;
-    const totalLiabilities = (BigInt(data.d_supply) * BigInt(data.d_rate)) / SCALAR_12;
-    const availableLiquidity = totalSupply > totalLiabilities ? totalSupply - totalLiabilities : 0n;
-
-    const util = totalSupply === 0n ? 0 : Math.min(Number(totalLiabilities) / Number(totalSupply), 1);
-    const target = config.util / SCALAR_7;
-    const irMod = Number(data.ir_mod) / SCALAR_7;
-    const rBase = config.r_base / SCALAR_7;
-    const rOne = config.r_one / SCALAR_7;
-    const rTwo = config.r_two / SCALAR_7;
-    const rThree = config.r_three / SCALAR_7;
-
-    let borrowApr: number;
-    if (util <= target) {
-        borrowApr = (rBase + rOne * (util / target)) * irMod;
-    } else if (util <= 0.95) {
-        borrowApr = (rBase + rOne + rTwo * ((util - target) / (0.95 - target))) * irMod;
-    } else {
-        borrowApr = (rBase + rOne + rTwo) * irMod + rThree * ((util - 0.95) / 0.05);
-    }
-
-    const supplyApr = borrowApr * util * (1 - bstopRate / SCALAR_7);
-    return {
-        supplyAprBps: Math.round(supplyApr * 10_000),
-        availableLiquidity,
-        enabled: config.enabled,
-    };
-}
-
 function addressArg(address: string): xdr.ScVal {
     return nativeToScVal(address, { type: "address" });
-}
-
-function formatPercent(bps: number): string {
-    return `${(bps / 100).toFixed(2)}%`;
-}
-
-function formatDuration(seconds: number): string {
-    if (seconds >= 2 * 86_400) return `${(seconds / 86_400).toFixed(1)} days`;
-    return `${(seconds / 3600).toFixed(1)} h`;
-}
-
-function formatXlm(stroops: bigint): string {
-    return `${(Number(stroops) / 1e7).toFixed(2)} XLM`;
 }
 
 // Read-only call through simulation: nothing is signed or sent
