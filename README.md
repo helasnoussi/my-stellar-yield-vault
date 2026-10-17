@@ -14,13 +14,14 @@ A decentralized yield vault smart contract built on Stellar using Soroban. The p
 
 ## Deployment Details (Stellar Testnet)
 
-- **Vault Contract ID:** `CBQNINP25MA4GE45V4CY42UFBEAZ24O2U2MBR53NBA25DV5EERYAB3SO`
+- **Vault Contract ID:** `CA74TR35JB5FA5BICITT7SEZ3S4QRIZBQUCDUXZ7GWUNIPOQVWN7OOFX`
 - **Underlying Token (Native XLM):** `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`
 - **Admin Account:** `GBRHOUDYVMYERRSFYOELPSZMKSIAFAXHEGGGTLQ5YUZ7GXPQZ5I5R5WH`
 
 ## Autonomous agent
 
-`agent.js` implements a conservative hybrid rebalancer:
+`agent.js` is the recommended production/demo entry point. It implements a
+conservative hybrid rebalancer:
 
 - keeps at least 30 XLM liquid;
 - targets at most 70% of total assets in the vault;
@@ -59,6 +60,42 @@ vault, and caps each operation at 100 XLM. The smart contract enforces the
 same cap for direct CLI and API calls. Raven MCP and x402 are optional
 signal/payment integrations; neither receives the Stellar signing key.
 
+### Strategy selection
+
+The agent selects strategies deterministically after applying local safety
+filters. Configure `YIELD_API_URL` to load a JSON array of strategies from an
+external yield API:
+
+```env
+YIELD_API_URL=https://example.com/api/strategies
+```
+
+The response must contain entries with fields such as:
+
+```json
+[
+  {
+    "id": 1,
+    "name": "Example XLM Vault",
+    "asset": "XLM",
+    "estimatedApy": 8.5,
+    "riskScore": 2,
+    "liquidityStroops": "5000000000",
+    "feesBps": 20
+  }
+]
+```
+
+Strategies are filtered locally by `asset`, `MAX_RISK_SCORE`, `MIN_APY_BPS`,
+and available liquidity. The selected strategy maximizes estimated APY minus
+fees. If `YIELD_API_URL` is empty, `RAVEN_STRATEGIES_JSON` is used as the
+offline/demo source.
+
+The repository also contains a TypeScript runner in `src/agent.ts`. Compile it
+with `npm run build` to produce `dist/agent.js`. It uses `AGENT_SECRET_KEY`
+(falling back to `ADMIN_SECRET_KEY`) and the `CONTRACT_ID` from `.env`.
+The signing account must first be configured on-chain with `set_agent`.
+
 The demo strategy metadata uses:
 
 ```json
@@ -96,19 +133,61 @@ optional x402 payments and keep the vault signing key local.
 ### Prerequisites
 
 - Rust toolchain (configured for `wasm32v1-none`)
-- Stellar CLI (`stellar`)
+- Stellar CLI (`stellar`) v25.2.0 or newer (required by `soroban-sdk` 28)
+- Node.js 20 or newer
 
 ### Build Contract
 
 ```bash
-cargo build --target wasm32v1-none --release
+stellar contract build
 ```
+
+Run the contract tests with:
+
+```bash
+cargo test
+```
+
+### Deploy Contract
+
+The deploy command requires a funded Testnet account to pay and sign the
+transaction. Configure a Stellar CLI identity first, then deploy the compiled
+WASM. The vault is configured by its constructor during deployment, so the
+admin and token are passed after the `--` separator:
+
+```bash
+stellar contract deploy \
+  --wasm target/wasm32v1-none/release/yield_vault.wasm \
+  --source-account <TESTNET_ACCOUNT_ALIAS> \
+  --rpc-url https://soroban-testnet.stellar.org \
+  --network-passphrase "Test SDF Network ; September 2015" \
+  --alias yield-vault \
+  -- \
+  --admin <ADMIN_PUBLIC_KEY> \
+  --token CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+```
+
+The constructor runs exactly once, atomically with deployment, so there is no
+separate initialization step and no window in which another account could
+initialize the vault first.
+
+`<TESTNET_ACCOUNT_ALIAS>` must be an existing Stellar CLI identity, or you can
+use a public/secret key supported by the CLI. Do not commit a secret key or
+place it in the README. For a configured identity, verify the available
+accounts with:
+
+```bash
+stellar keys ls
+```
+
+The command returns the new contract ID. Update the deployment details and
+`.env` `CONTRACT_ID` only after confirming that the deployment succeeded.
 
 Interact with the Vault (example):
 
 ```bash
 stellar contract invoke \
-  --contract-id CBQNINP25MA4GE45V4CY42UFBEAZ24O2U2MBR53NBA25DV5EERYAB3SO \
+  --contract-id CA74TR35JB5FA5BICITT7SEZ3S4QRIZBQUCDUXZ7GWUNIPOQVWN7OOFX \
   --source moi \
   --network testnet \
   -- deposit \
@@ -117,6 +196,15 @@ stellar contract invoke \
 ```
 
 Amounts are expressed in stroops: `1000000000` stroops equals `100 XLM`.
+
+### TypeScript build
+
+To compile the TypeScript prototype:
+
+```bash
+npm install
+npm run build
+```
 
 ## License
 
