@@ -6,8 +6,14 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("testutils"))'] }
+
 [dependencies]
-soroban-sdk = "20.5.0" # Assurez-vous d'utiliser la version de SDK adaptée à votre environnement Soroban
+soroban-sdk = "28.0.0"
+
+[dev-dependencies]
+soroban-sdk = { version = "28.0.0", features = ["testutils"] }
 
 [profile.release]
 opt-level = "z"
