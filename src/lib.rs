@@ -1,7 +1,16 @@
 #![no_std]
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{
+    auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
+    contract, contractevent, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal,
+    Map, Vec,
+};
+
+mod blend;
+use blend::{PoolClient, Request, REQUEST_SUPPLY, REQUEST_WITHDRAW, SCALAR_12};
 
 const MAX_OPERATION_STROOPS: i128 = 1_000_000_000;
+// Chaque pool coûte deux appels inter-contrats dans total_assets
+const MAX_POOLS: u32 = 5;
 
 // ~5 s par ledger : 17 280 ledgers ≈ 1 jour
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -14,7 +23,8 @@ pub enum DataKey {
     Token,
     TotalShares,
     UserShare(Address),
-    Agent, // Nouvelle clé pour stocker l'adresse de l'agent IA
+    Agent,
+    Pools, // Map<u32, Address> des pools Blend autorisés par l'admin
 }
 
 #[contractevent(data_format = "single-value")]
@@ -32,10 +42,17 @@ pub struct Withdraw {
 }
 
 #[contractevent(data_format = "single-value")]
-pub struct StrategyExecuted {
+pub struct Allocated {
     #[topic]
-    pub agent: Address,
-    pub strategy_id: u32,
+    pub pool_id: u32,
+    pub amount: i128,
+}
+
+#[contractevent(data_format = "single-value")]
+pub struct Deallocated {
+    #[topic]
+    pub pool_id: u32,
+    pub amount: i128,
 }
 
 #[contract]
@@ -48,68 +65,265 @@ impl YieldVault {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::TotalShares, &0i128);
+        env.storage().instance().set(&DataKey::Pools, &Map::<u32, Address>::new(&env));
         Self::extend_instance(&env);
     }
 
     // 2. Définir ou mettre à jour l'adresse de l'agent IA (réservé à l'admin)
     pub fn set_agent(env: Env, agent: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
+        Self::require_admin(&env);
         env.storage().instance().set(&DataKey::Agent, &agent);
         Self::extend_instance(&env);
     }
 
-    // 3. Fonction deposit
+    // 3. Autoriser un pool Blend (réservé à l'admin). L'agent ne peut placer
+    //    les fonds que dans les pools de cette liste.
+    pub fn add_pool(env: Env, pool_id: u32, pool: Address) {
+        Self::require_admin(&env);
+        let mut pools = Self::pools(env.clone());
+        if pools.contains_key(pool_id) {
+            panic!("Pool id already used");
+        }
+        if pools.len() >= MAX_POOLS {
+            panic!("Too many pools");
+        }
+        pools.set(pool_id, pool);
+        env.storage().instance().set(&DataKey::Pools, &pools);
+        Self::extend_instance(&env);
+    }
+
+    // 4. Retirer un pool vide de la liste (réservé à l'admin)
+    pub fn remove_pool(env: Env, pool_id: u32) {
+        Self::require_admin(&env);
+        if Self::pool_assets(env.clone(), pool_id) > 0 {
+            panic!("Pool still holds vault funds");
+        }
+        let mut pools = Self::pools(env.clone());
+        pools.remove(pool_id);
+        env.storage().instance().set(&DataKey::Pools, &pools);
+        Self::extend_instance(&env);
+    }
+
+    // 5. Dépôt : `amount` XLM contre des parts au prix courant du vault
     pub fn deposit(env: Env, from: Address, amount: i128) {
         from.require_auth();
         Self::validate_operation_amount(amount);
 
-        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        // Prix calculé avant le transfert entrant
+        let total_assets = Self::total_assets(env.clone());
+        let total_shares = Self::total_shares(&env);
+        let minted = amount * (total_shares + 1) / (total_assets + 1);
+        if minted <= 0 {
+            panic!("Deposit too small");
+        }
 
-        token_client.transfer(&from, &env.current_contract_address(), &amount);
+        Self::token_client(&env).transfer(&from, &env.current_contract_address(), &amount);
 
         let key = DataKey::UserShare(from.clone());
-        let mut user_shares: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        user_shares += amount;
-        env.storage().persistent().set(&key, &user_shares);
+        let user_shares: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(user_shares + minted));
         Self::extend_persistent(&env, &key);
 
-        let mut total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
-        total_shares += amount;
-        env.storage().instance().set(&DataKey::TotalShares, &total_shares);
+        env.storage().instance().set(&DataKey::TotalShares, &(total_shares + minted));
         Self::extend_instance(&env);
 
         Deposit { from, amount }.publish(&env);
     }
 
-    // 4. Fonction de retrait
+    // 6. Retrait : `amount` XLM, en brûlant les parts correspondantes
+    //    (arrondi en faveur du vault)
     pub fn withdraw(env: Env, to: Address, amount: i128) {
         to.require_auth();
         Self::validate_operation_amount(amount);
 
-        let key = DataKey::UserShare(to.clone());
-        let mut user_shares: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let total_assets = Self::total_assets(env.clone());
+        let total_shares = Self::total_shares(&env);
+        let burned = Self::div_ceil(amount * (total_shares + 1), total_assets + 1);
 
-        if user_shares < amount {
+        let key = DataKey::UserShare(to.clone());
+        let user_shares: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if user_shares < burned {
             panic!("Insufficient shares");
         }
 
-        // Mise à jour de l'état avant le transfert sortant
-        user_shares -= amount;
-        env.storage().persistent().set(&key, &user_shares);
+        // Mise à jour de l'état avant tout appel externe
+        env.storage().persistent().set(&key, &(user_shares - burned));
         Self::extend_persistent(&env, &key);
-
-        let mut total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
-        total_shares -= amount;
-        env.storage().instance().set(&DataKey::TotalShares, &total_shares);
+        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - burned));
         Self::extend_instance(&env);
 
-        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
-        token_client.transfer(&env.current_contract_address(), &to, &amount);
+        Self::ensure_liquidity(&env, amount);
+        Self::token_client(&env).transfer(&env.current_contract_address(), &to, &amount);
 
         Withdraw { to, amount }.publish(&env);
+    }
+
+    // 7. L'agent place des XLM du vault dans un pool autorisé (prêt simple)
+    pub fn allocate(env: Env, pool_id: u32, amount: i128) {
+        Self::require_agent(&env);
+        Self::validate_operation_amount(amount);
+        let pool = Self::pool_address(&env, pool_id);
+        let token = Self::token_address(&env);
+        let vault = env.current_contract_address();
+
+        if Self::token_client(&env).balance(&vault) < amount {
+            panic!("Not enough idle funds");
+        }
+
+        // Le pool appelle token.transfer(vault, pool, amount) : le vault doit
+        // autoriser explicitement cet appel imbriqué.
+        env.authorize_as_current_contract(vec![
+            &env,
+            InvokerContractAuthEntry::Contract(SubContractInvocation {
+                context: ContractContext {
+                    contract: token.clone(),
+                    fn_name: symbol_short!("transfer"),
+                    args: (vault.clone(), pool.clone(), amount).into_val(&env),
+                },
+                sub_invocations: Vec::new(&env),
+            }),
+        ]);
+        Self::submit(&env, &pool, &token, amount, REQUEST_SUPPLY);
+        Self::extend_instance(&env);
+
+        Allocated { pool_id, amount }.publish(&env);
+    }
+
+    // 8. L'agent récupère des XLM d'un pool autorisé
+    pub fn deallocate(env: Env, pool_id: u32, amount: i128) {
+        Self::require_agent(&env);
+        Self::validate_operation_amount(amount);
+        let pool = Self::pool_address(&env, pool_id);
+        let withdrawn = Self::withdraw_from_pool(&env, &pool, amount);
+        Self::extend_instance(&env);
+
+        Deallocated { pool_id, amount: withdrawn }.publish(&env);
+    }
+
+    // ---------- Lectures ----------
+
+    pub fn shares_of(env: Env, owner: Address) -> i128 {
+        let key = DataKey::UserShare(owner);
+        let shares = env.storage().persistent().get(&key).unwrap_or(0);
+        if shares > 0 {
+            Self::extend_persistent(&env, &key);
+        }
+        shares
+    }
+
+    // Valeur en XLM des parts d'un déposant
+    pub fn balance_of(env: Env, owner: Address) -> i128 {
+        let shares = Self::shares_of(env.clone(), owner);
+        shares * (Self::total_assets(env.clone()) + 1) / (Self::total_shares(&env) + 1)
+    }
+
+    // XLM disponibles dans le vault + XLM placés dans les pools (intérêts compris)
+    pub fn total_assets(env: Env) -> i128 {
+        let mut total = Self::token_client(&env).balance(&env.current_contract_address());
+        for pool_id in Self::pools(env.clone()).keys() {
+            total += Self::pool_assets(env.clone(), pool_id);
+        }
+        total
+    }
+
+    // Valeur en XLM de la position du vault dans un pool
+    pub fn pool_assets(env: Env, pool_id: u32) -> i128 {
+        let pool = PoolClient::new(&env, &Self::pool_address(&env, pool_id));
+        let reserve = pool.get_reserve(&Self::token_address(&env));
+        let positions = pool.get_positions(&env.current_contract_address());
+        let b_tokens = positions.supply.get(reserve.config.index).unwrap_or(0);
+        b_tokens * reserve.data.b_rate / SCALAR_12
+    }
+
+    pub fn token(env: Env) -> Address {
+        Self::token_address(&env)
+    }
+
+    pub fn pools(env: Env) -> Map<u32, Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Pools)
+            .unwrap_or(Map::new(&env))
+    }
+
+    // ---------- Fonctions internes ----------
+
+    fn require_admin(env: &Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+    }
+
+    fn require_agent(env: &Env) {
+        let agent: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Agent)
+            .expect("Agent not configured");
+        agent.require_auth();
+    }
+
+    fn token_address(env: &Env) -> Address {
+        env.storage().instance().get(&DataKey::Token).unwrap()
+    }
+
+    fn token_client(env: &Env) -> soroban_sdk::token::Client<'_> {
+        soroban_sdk::token::Client::new(env, &Self::token_address(env))
+    }
+
+    fn total_shares(env: &Env) -> i128 {
+        env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0)
+    }
+
+    fn pool_address(env: &Env, pool_id: u32) -> Address {
+        Self::pools(env.clone()).get(pool_id).expect("Unknown pool")
+    }
+
+    fn submit(env: &Env, pool: &Address, token: &Address, amount: i128, request_type: u32) {
+        let vault = env.current_contract_address();
+        let requests = vec![
+            env,
+            Request {
+                address: token.clone(),
+                amount,
+                request_type,
+            },
+        ];
+        PoolClient::new(env, pool).submit(&vault, &vault, &vault, &requests);
+    }
+
+    // Retire jusqu'à `amount` XLM d'un pool et renvoie le montant reçu
+    fn withdraw_from_pool(env: &Env, pool: &Address, amount: i128) -> i128 {
+        let token = Self::token_address(env);
+        let vault = env.current_contract_address();
+        let before = Self::token_client(env).balance(&vault);
+        Self::submit(env, pool, &token, amount, REQUEST_WITHDRAW);
+        Self::token_client(env).balance(&vault) - before
+    }
+
+    // Complète les XLM disponibles en puisant dans les pools si nécessaire
+    fn ensure_liquidity(env: &Env, amount: i128) {
+        let vault = env.current_contract_address();
+        let mut idle = Self::token_client(env).balance(&vault);
+        if idle >= amount {
+            return;
+        }
+        for pool_id in Self::pools(env.clone()).keys() {
+            if Self::pool_assets(env.clone(), pool_id) == 0 {
+                continue;
+            }
+            let pool = Self::pool_address(env, pool_id);
+            let withdrawn = Self::withdraw_from_pool(env, &pool, amount - idle);
+            Deallocated { pool_id, amount: withdrawn }.publish(env);
+            idle += withdrawn;
+            if idle >= amount {
+                return;
+            }
+        }
+        panic!("Not enough liquidity");
+    }
+
+    fn div_ceil(numerator: i128, denominator: i128) -> i128 {
+        (numerator + denominator - 1) / denominator
     }
 
     fn extend_instance(env: &Env) {
@@ -127,26 +341,6 @@ impl YieldVault {
         if amount > MAX_OPERATION_STROOPS {
             panic!("Operation amount exceeds 100 XLM limit");
         }
-    }
-
-    pub fn shares_of(env: Env, owner: Address) -> i128 {
-        let key = DataKey::UserShare(owner);
-        let shares = env.storage().persistent().get(&key).unwrap_or(0);
-        if shares > 0 {
-            Self::extend_persistent(&env, &key);
-        }
-        shares
-    }
-
-    // 6. Fonction exécutée par l'agent IA pour la stratégie / rééquilibrage
-    pub fn execute_strategy(env: Env, strategy_id: u32) {
-        let agent: Address = env.storage().instance().get(&DataKey::Agent).expect("Agent not configured");
-        agent.require_auth();
-        Self::extend_instance(&env);
-
-        // Logique de stratégie (ex: interaction avec un pool ou réaffectation interne)
-        // Pour le hackathon, vous pouvez émettre un événement pour notifier le script off-chain
-        StrategyExecuted { agent, strategy_id }.publish(&env);
     }
 }
 

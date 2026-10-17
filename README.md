@@ -1,130 +1,107 @@
 # 🌾 Stellar Smart Yield Vault
 
-A decentralized yield vault smart contract built on Stellar using Soroban. The project demonstrates an autonomous agent that manages deposits and withdrawals on the Stellar Testnet under strict local risk limits.
+A yield vault on Stellar, written as a Soroban smart contract. Users deposit XLM
+and receive shares; an autonomous agent lends the vault's idle XLM to
+[Blend](https://github.com/blend-capital/blend-contracts-v2) v2 lending pools,
+and the interest earned raises the value of every share. The contract confines
+the agent: it can only move funds between the vault and pools the admin has
+approved, never to an arbitrary address.
 
 ## 🚀 Features
 
-- **Secure Deposits:** Interacts cleanly with the Stellar Asset Contract (SAC) to handle token transfers.
-- **Withdrawals:** Users can withdraw tokens up to their recorded share balance.
-- **Soroban Powered:** Written in Rust and optimized for the `wasm32v1-none` target.
-- **Autonomous Agent:** Rebalances the wallet and vault position while preserving a liquidity reserve.
-- **Testnet Verified:** Deployed, initialized, and tested on Stellar Testnet.
+- **Deposits and shares:** deposits go through the Stellar Asset Contract (SAC). A share is worth `total_assets / total_shares`, so interest accrues to depositors, and new depositors buy at the current price.
+- **Withdrawals:** users withdraw XLM up to the value of their shares; if the vault's idle XLM is short, it pulls the difference back from Blend automatically.
+- **Blend allocation:** the agent lends idle XLM to admin-approved Blend pools as a plain supply (no collateral, no borrowing, so no liquidation risk).
+- **Guardrails in the contract:** only the configured agent can allocate, only to approved pools, at most 100 XLM per operation.
+- **Yield measured, not just estimated:** the agent reports the pool's instant rate and the yield a Blend position actually earned over the last 7 days, and decides on the latter.
+- **Testnet verified:** deployed on Stellar Testnet, with unit tests and a test against a local copy of the real Blend testnet pool.
 
 ---
 
 ## Deployment Details (Stellar Testnet)
 
-- **Vault Contract ID:** `CA74TR35JB5FA5BICITT7SEZ3S4QRIZBQUCDUXZ7GWUNIPOQVWN7OOFX`
+- **Vault Contract ID:** `CDYRFTVVJNU25W54E2H42I2YLCR3SATYLWFON6LSBFGS5GHIB4QIXSGY`
 - **Underlying Token (Native XLM):** `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`
 - **Admin Account:** `GBRHOUDYVMYERRSFYOELPSZMKSIAFAXHEGGGTLQ5YUZ7GXPQZ5I5R5WH`
+- **Agent Account:** `GAXWJXQG7LIZNU3HNLAEK5QA3T47I6TQELCOI6UOMIUMHJCHL2BOQIPJ`
+- **Approved Blend Pool (id 1):** `CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF`
 
-## Autonomous agent
+## Smart contract
 
-`agent.js` is the recommended production/demo entry point. It implements a
-conservative hybrid rebalancer:
+| Function | Who | What it does |
+|---|---|---|
+| `__constructor(admin, token)` | deployer | Sets the admin and the vault token, once, at deployment |
+| `set_agent(agent)` | admin | Sets the account allowed to allocate funds |
+| `add_pool(pool_id, pool)` / `remove_pool(pool_id)` | admin | Approves a Blend pool; a pool can only be removed once the vault's position in it is empty |
+| `deposit(from, amount)` | user | Deposits `amount` XLM and mints shares at the current price |
+| `withdraw(to, amount)` | user | Withdraws `amount` XLM, burns the matching shares, pulls from Blend if needed |
+| `allocate(pool_id, amount)` / `deallocate(pool_id, amount)` | agent | Lends idle XLM to an approved pool / takes it back |
+| `total_assets()`, `pool_assets(pool_id)` | anyone | Idle XLM plus pool positions including interest / one pool's position |
+| `shares_of(owner)`, `balance_of(owner)` | anyone | A depositor's shares / their value in XLM |
+| `pools()`, `token()` | anyone | Approved pools / the vault token |
 
-- keeps at least 30 XLM liquid;
-- targets at most 70% of total assets in the vault;
-- caps each operation at 100 XLM in both the agent and the smart contract;
-- checks the vault position through `shares_of`;
-- runs once by default (`AGENT_ONCE=true`);
-- uses dry-run mode by default (`AGENT_EXECUTE=false`).
+Every deposit, withdrawal, allocation and deallocation is capped at 100 XLM
+(`MAX_OPERATION_STROOPS`). Amounts are in stroops: `1000000000` stroops is
+`100 XLM`.
 
-Copy `.env.example` to `.env`, provide `ADMIN_SECRET_KEY`, and run:
+## Autonomous agent (`src/agent.ts`)
+
+Each cycle the agent reads the approved pools on-chain and reports two rates:
+
+- **Instant annualized rate (estimate):** computed from the pool's current
+  parameters with Blend's interest rate model, as if utilization and the rate
+  modifier stayed the same for a year. It is a snapshot, not a forecast: it
+  moves as soon as borrowers repay or suppliers arrive.
+- **Realized yield:** how much a Blend supply position actually grew over the
+  last `REALIZED_WINDOW_SECONDS` (7 days by default), measured from the pool's
+  `b_rate` (the value of one supplied b_token). Past `b_rate` values come from
+  Blend's `supply`/`withdraw` events, which Stellar RPC keeps for about 7 days,
+  and from the agent's local history in `AGENT_STATE_FILE`.
+
+Decisions and the `MIN_APY_BPS` filter use the realized yield. When less than
+`REALIZED_MIN_SECONDS` of history exists, the agent falls back to the instant
+rate and says so in its log. The agent then takes one action:
+
+1. exit a pool that no longer passes the filters (disabled reserve, yield below
+   `MIN_APY_BPS`, or available liquidity below `MINIMUM_LIQUIDITY_STROOPS`);
+2. otherwise refill the idle reserve (`VAULT_IDLE_RESERVE_STROOPS`, 30 XLM by
+   default) from the lowest-yield pool;
+3. otherwise lend the excess above the reserve to the best eligible pool.
+
+Moves smaller than `MIN_ACTION_STROOPS` are skipped. The agent signs with
+`AGENT_SECRET_KEY` (falling back to `ADMIN_SECRET_KEY`), which must be the
+account configured with `set_agent`.
+
+Build it, then run one cycle in dry-run mode (the default: the transaction is
+simulated, not sent):
 
 ```bash
-cp .env.example .env
-node agent.js
+npm install
+npm run build
+AGENT_EXECUTE=false AGENT_ONCE=true npm start
 ```
 
-The safe default is a dry run executed once:
+After checking the proposed action, send it for real:
 
 ```bash
-AGENT_EXECUTE=false AGENT_ONCE=true node agent.js
+AGENT_EXECUTE=true AGENT_ONCE=true npm start
 ```
 
-After validating the proposed action, enable one real execution:
+Set `AGENT_ONCE=false` to run a cycle every `AGENT_INTERVAL_MS` (1 hour by
+default). To keep it running in the background:
 
 ```bash
-AGENT_EXECUTE=true AGENT_ONCE=true node agent.js
+tmux new -d -s agent 'AGENT_EXECUTE=true AGENT_ONCE=false npm start 2>&1 | tee -a agent.log'
+tmux attach -t agent        # watch it (Ctrl+B then D to detach)
+tmux kill-session -t agent  # stop it
 ```
 
-Set `AGENT_ONCE=false` to run the hourly loop:
+> Neither rate is a guarantee: the realized yield describes the past, and the
+> testnet pool's rates are unusually high because it is almost fully borrowed.
+> A Blend pool can be misconfigured or exploited (for example the YieldBlox
+> pool drain of February 2026), so only approve pools you have reviewed.
 
-```bash
-AGENT_EXECUTE=true AGENT_ONCE=false node agent.js
-```
-
-The agent keeps at least 30 XLM liquid, targets at most 70% invested in the
-vault, and caps each operation at 100 XLM. The smart contract enforces the
-same cap for direct CLI and API calls. Raven MCP and x402 are optional
-signal/payment integrations; neither receives the Stellar signing key.
-
-### Strategy selection
-
-The agent selects strategies deterministically after applying local safety
-filters. Configure `YIELD_API_URL` to load a JSON array of strategies from an
-external yield API:
-
-```env
-YIELD_API_URL=https://example.com/api/strategies
-```
-
-The response must contain entries with fields such as:
-
-```json
-[
-  {
-    "id": 1,
-    "name": "Example XLM Vault",
-    "asset": "XLM",
-    "estimatedApy": 8.5,
-    "riskScore": 2,
-    "liquidityStroops": "5000000000",
-    "feesBps": 20
-  }
-]
-```
-
-Strategies are filtered locally by `asset`, `MAX_RISK_SCORE`, `MIN_APY_BPS`,
-and available liquidity. The selected strategy maximizes estimated APY minus
-fees. If `YIELD_API_URL` is empty, `RAVEN_STRATEGIES_JSON` is used as the
-offline/demo source.
-
-The repository also contains a TypeScript runner in `src/agent.ts`. Compile it
-with `npm run build` to produce `dist/agent.js`. It uses `AGENT_SECRET_KEY`
-(falling back to `ADMIN_SECRET_KEY`) and the `CONTRACT_ID` from `.env`.
-The signing account must first be configured on-chain with `set_agent`.
-
-The demo strategy metadata uses:
-
-```json
-{
-  "estimatedApy": 8.5,
-  "riskScore": 2,
-  "liquidityStroops": "2000000000",
-  "feesBps": 20
-}
-```
-
-These values mean 8.5% estimated APY, risk score 2, 200 XLM declared
-liquidity, and 0.20% estimated fees. They are simulated demo data, not an
-audit, financial rating, or guarantee.
-
-### Strategy discovery
-
-When `RAVEN_ENABLED=true` and `RAVEN_OAUTH_TOKEN` is configured, the agent
-queries `RAVEN_MCP_URL` for strategy context, normalizes candidate strategies,
-and filters them locally by asset, risk, APY, fees, and liquidity. Raven can
-inform the comparison but cannot sign transactions or switch to an unsupported
-contract. For a demo without OAuth, `RAVEN_STRATEGIES_JSON` can provide a
-machine-readable strategy list.
-
-> **Demo disclaimer:** the risk score used in the hackathon demo is simulated
-> metadata. It is not an audit, a financial rating, or a guarantee of safety.
-
-Never commit `.env` or expose `ADMIN_SECRET_KEY`. Use a separate wallet for
-optional x402 payments and keep the vault signing key local.
+Never commit `.env` or expose `ADMIN_SECRET_KEY` or `AGENT_SECRET_KEY`.
 
 ---
 
@@ -136,19 +113,25 @@ optional x402 payments and keep the vault signing key local.
 - Stellar CLI (`stellar`) v25.2.0 or newer (required by `soroban-sdk` 28)
 - Node.js 20 or newer
 
-### Build Contract
+Copy the configuration template and fill in the keys and the contract ID:
+
+```bash
+cp .env.example .env
+```
+
+### Build and test the contract
 
 ```bash
 stellar contract build
-```
-
-Run the contract tests with:
-
-```bash
 cargo test
 ```
 
-### Deploy Contract
+The unit tests use a mock Blend pool. `blend_testnet_fork` (ignored by
+default) runs the vault against a local copy of the real Blend testnet pool;
+the steps to create that copy are in the comment above the test in
+`src/test.rs`.
+
+### Deploy the contract
 
 The deploy command requires a funded Testnet account to pay and sign the
 transaction. Configure a Stellar CLI identity first, then deploy the compiled
@@ -161,7 +144,6 @@ stellar contract deploy \
   --source-account <TESTNET_ACCOUNT_ALIAS> \
   --rpc-url https://soroban-testnet.stellar.org \
   --network-passphrase "Test SDF Network ; September 2015" \
-  --alias yield-vault \
   -- \
   --admin <ADMIN_PUBLIC_KEY> \
   --token CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
@@ -169,41 +151,45 @@ stellar contract deploy \
 
 The constructor runs exactly once, atomically with deployment, so there is no
 separate initialization step and no window in which another account could
-initialize the vault first.
+initialize the vault first. List the available CLI identities with
+`stellar keys ls`. The command returns the new contract ID: set it as
+`CONTRACT_ID` in `.env` once the deployment succeeded.
 
-`<TESTNET_ACCOUNT_ALIAS>` must be an existing Stellar CLI identity, or you can
-use a public/secret key supported by the CLI. Do not commit a secret key or
-place it in the README. For a configured identity, verify the available
-accounts with:
+### Configure the agent and the Blend pool
+
+With `ADMIN_SECRET_KEY` and `AGENT_SECRET_KEY` in `.env`, run once:
 
 ```bash
-stellar keys ls
+node init.js
 ```
 
-The command returns the new contract ID. Update the deployment details and
-`.env` `CONTRACT_ID` only after confirming that the deployment succeeded.
-
-Interact with the Vault (example):
+It calls `set_agent` with the `AGENT_SECRET_KEY` account and approves
+`BLEND_POOL_ID` (the Blend testnet pool by default) as pool id `1`. Without
+the admin key in `.env`, the same configuration works with the admin's CLI
+identity:
 
 ```bash
-stellar contract invoke \
-  --contract-id CA74TR35JB5FA5BICITT7SEZ3S4QRIZBQUCDUXZ7GWUNIPOQVWN7OOFX \
-  --source moi \
-  --network testnet \
-  -- deposit \
-  --from GBRHOUDYVMYERRSFYOELPSZMKSIAFAXHEGGGTLQ5YUZ7GXPQZ5I5R5WH \
-  --amount 1000000000
+NET='--rpc-url https://soroban-testnet.stellar.org --network-passphrase "Test SDF Network ; September 2015"'
+eval stellar contract invoke --id <CONTRACT_ID> --source-account <ADMIN_ALIAS> $NET \
+  -- set_agent --agent <AGENT_PUBLIC_KEY>
+eval stellar contract invoke --id <CONTRACT_ID> --source-account <ADMIN_ALIAS> $NET \
+  -- add_pool --pool_id 1 --pool CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF
 ```
 
-Amounts are expressed in stroops: `1000000000` stroops equals `100 XLM`.
-
-### TypeScript build
-
-To compile the TypeScript prototype:
+### Use the vault
 
 ```bash
-npm install
-npm run build
+# Deposit 100 XLM
+eval stellar contract invoke --id <CONTRACT_ID> --source-account <USER_ALIAS> $NET \
+  -- deposit --from <USER_PUBLIC_KEY> --amount 1000000000
+
+# Value of a depositor's shares, in stroops
+eval stellar contract invoke --id <CONTRACT_ID> --source-account <USER_ALIAS> $NET --send=no \
+  -- balance_of --owner <USER_PUBLIC_KEY>
+
+# Withdraw 50 XLM
+eval stellar contract invoke --id <CONTRACT_ID> --source-account <USER_ALIAS> $NET \
+  -- withdraw --to <USER_PUBLIC_KEY> --amount 500000000
 ```
 
 ## License

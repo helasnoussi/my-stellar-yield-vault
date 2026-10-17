@@ -8,3 +8,5 @@ dist/
 .stellar/
 .DS_Store
 .env
+.agent-state.json
+agent.log
