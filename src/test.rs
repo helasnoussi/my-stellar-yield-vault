@@ -324,6 +324,103 @@ fn withdraw_pulls_from_pool_when_idle_is_short() {
     assert_eq!(s.vault.total_assets(), 200_000_000);
 }
 
+// ---------- Pause d'urgence ----------
+
+#[test]
+#[should_panic(expected = "Vault is paused")]
+fn paused_vault_rejects_deposits() {
+    let s = setup();
+    s.vault.pause();
+    s.vault.deposit(&s.user, &100_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Vault is paused")]
+fn paused_vault_rejects_allocations() {
+    let s = setup();
+    s.vault.deposit(&s.user, &500_000_000);
+    s.vault.pause();
+    s.vault.allocate(&1, &100_000_000);
+}
+
+#[test]
+fn paused_vault_still_allows_withdrawals_and_deallocations() {
+    let s = setup();
+    s.vault.deposit(&s.user, &500_000_000);
+    s.vault.allocate(&1, &400_000_000);
+    s.vault.pause();
+
+    s.vault.deallocate(&1, &100_000_000);
+    s.vault.withdraw(&s.user, &300_000_000);
+    assert_eq!(s.token.balance(&s.user), 4_800_000_000);
+}
+
+#[test]
+fn unpause_reopens_deposits() {
+    let s = setup();
+    s.vault.pause();
+    assert!(s.vault.is_paused());
+    s.vault.unpause();
+    assert!(!s.vault.is_paused());
+    s.vault.deposit(&s.user, &100_000_000);
+}
+
+#[test]
+fn pause_requires_admin() {
+    let s = setup();
+    let stranger = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &MockAuthInvoke {
+            contract: &s.vault.address,
+            fn_name: "pause",
+            args: ().into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.vault.try_pause().is_err());
+    assert!(!s.vault.is_paused());
+}
+
+#[test]
+fn emergency_withdraw_brings_everything_back_and_pauses() {
+    let s = setup();
+    // Plusieurs allocations : la position dépasse le plafond de 100 XLM
+    let whale = Address::generate(&s.env);
+    s.token_admin.mint(&whale, &3_000_000_000);
+    for _ in 0..3 {
+        s.vault.deposit(&whale, &1_000_000_000);
+        s.vault.allocate(&1, &1_000_000_000);
+    }
+    s.token_admin.mint(&s.pool.address, &300_000_000);
+    s.pool.set_b_rate(&(SCALAR_12 * 11 / 10));
+    assert_eq!(s.vault.pool_assets(&1), 3_300_000_000);
+
+    let withdrawn = s.vault.emergency_withdraw(&1);
+    assert_eq!(withdrawn, 3_300_000_000);
+    assert_eq!(s.vault.pool_assets(&1), 0);
+    assert_eq!(s.token.balance(&s.vault.address), 3_300_000_000);
+    assert!(s.vault.is_paused());
+}
+
+#[test]
+fn emergency_withdraw_requires_admin() {
+    let s = setup();
+    s.vault.deposit(&s.user, &500_000_000);
+    s.vault.allocate(&1, &400_000_000);
+    s.env.mock_auths(&[MockAuth {
+        address: &s.agent,
+        invoke: &MockAuthInvoke {
+            contract: &s.vault.address,
+            fn_name: "emergency_withdraw",
+            args: (1u32,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.vault.try_emergency_withdraw(&1).is_err());
+    assert_eq!(s.vault.pool_assets(&1), 400_000_000);
+}
+
 // ---------- Gestion des pools ----------
 
 #[test]

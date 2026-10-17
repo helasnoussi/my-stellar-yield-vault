@@ -25,6 +25,7 @@ pub enum DataKey {
     UserShare(Address),
     Agent,
     Pools, // Map<u32, Address> des pools Blend autorisés par l'admin
+    Paused,
 }
 
 #[contractevent(data_format = "single-value")]
@@ -53,6 +54,11 @@ pub struct Deallocated {
     #[topic]
     pub pool_id: u32,
     pub amount: i128,
+}
+
+#[contractevent(data_format = "single-value")]
+pub struct Paused {
+    pub paused: bool,
 }
 
 #[contract]
@@ -104,9 +110,42 @@ impl YieldVault {
         Self::extend_instance(&env);
     }
 
-    // 5. Dépôt : `amount` XLM contre des parts au prix courant du vault
+    // 5. Pause d'urgence (réservée à l'admin) : bloque les dépôts et les
+    //    placements. Les retraits restent ouverts, ainsi que deallocate qui
+    //    ne fait que rapatrier des fonds vers le vault.
+    pub fn pause(env: Env) {
+        Self::require_admin(&env);
+        Self::set_paused(&env, true);
+    }
+
+    pub fn unpause(env: Env) {
+        Self::require_admin(&env);
+        Self::set_paused(&env, false);
+    }
+
+    // 6. Rapatrie toute la position d'un pool vers le vault, sans plafond, et met
+    //    le vault en pause. Les fonds restent dans le vault : l'admin ne peut
+    //    pas les recevoir.
+    pub fn emergency_withdraw(env: Env, pool_id: u32) -> i128 {
+        Self::require_admin(&env);
+        let position = Self::pool_assets(env.clone(), pool_id);
+        let mut withdrawn = 0;
+        if position > 0 {
+            let pool = Self::pool_address(&env, pool_id);
+            withdrawn = Self::withdraw_from_pool(&env, &pool, position);
+            Deallocated { pool_id, amount: withdrawn }.publish(&env);
+        }
+        if !Self::is_paused(env.clone()) {
+            Self::set_paused(&env, true);
+        }
+        Self::extend_instance(&env);
+        withdrawn
+    }
+
+    // 7. Dépôt : `amount` XLM contre des parts au prix courant du vault
     pub fn deposit(env: Env, from: Address, amount: i128) {
         from.require_auth();
+        Self::require_not_paused(&env);
         Self::validate_operation_amount(amount);
 
         // Prix calculé avant le transfert entrant
@@ -130,7 +169,7 @@ impl YieldVault {
         Deposit { from, amount }.publish(&env);
     }
 
-    // 6. Retrait : `amount` XLM, en brûlant les parts correspondantes
+    // 8. Retrait : `amount` XLM, en brûlant les parts correspondantes
     //    (arrondi en faveur du vault)
     pub fn withdraw(env: Env, to: Address, amount: i128) {
         to.require_auth();
@@ -158,9 +197,10 @@ impl YieldVault {
         Withdraw { to, amount }.publish(&env);
     }
 
-    // 7. L'agent place des XLM du vault dans un pool autorisé (prêt simple)
+    // 9. L'agent place des XLM du vault dans un pool autorisé (prêt simple)
     pub fn allocate(env: Env, pool_id: u32, amount: i128) {
         Self::require_agent(&env);
+        Self::require_not_paused(&env);
         Self::validate_operation_amount(amount);
         let pool = Self::pool_address(&env, pool_id);
         let token = Self::token_address(&env);
@@ -189,7 +229,7 @@ impl YieldVault {
         Allocated { pool_id, amount }.publish(&env);
     }
 
-    // 8. L'agent récupère des XLM d'un pool autorisé
+    // 10. L'agent récupère des XLM d'un pool autorisé
     pub fn deallocate(env: Env, pool_id: u32, amount: i128) {
         Self::require_agent(&env);
         Self::validate_operation_amount(amount);
@@ -239,6 +279,10 @@ impl YieldVault {
         Self::token_address(&env)
     }
 
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+    }
+
     pub fn pools(env: Env) -> Map<u32, Address> {
         env.storage()
             .instance()
@@ -247,6 +291,18 @@ impl YieldVault {
     }
 
     // ---------- Fonctions internes ----------
+
+    fn require_not_paused(env: &Env) {
+        if Self::is_paused(env.clone()) {
+            panic!("Vault is paused");
+        }
+    }
+
+    fn set_paused(env: &Env, paused: bool) {
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Self::extend_instance(env);
+        Paused { paused }.publish(env);
+    }
 
     fn require_admin(env: &Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();

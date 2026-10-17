@@ -160,6 +160,12 @@ export function App() {
                 </p>
             )}
             {loadError && <p className="notice">Could not read the vault: {loadError}</p>}
+            {vault?.paused && (
+                <p className="notice">
+                    The vault is paused by its admin: deposits and new Blend allocations are disabled.
+                    Withdrawals stay open.
+                </p>
+            )}
 
             <section className="stats">
                 <Stat label="Total managed" value={vault && `${xlm(vault.totalAssets)} XLM`} />
@@ -171,7 +177,7 @@ export function App() {
                 <section className="card">
                     <h2>Your position</h2>
                     {user ? (
-                        <PositionPanel user={user} position={position} onDone={refresh} />
+                        <PositionPanel user={user} position={position} paused={vault?.paused ?? false} onDone={refresh} />
                     ) : (
                         <p className="muted">Connect Freighter on Testnet to deposit and withdraw.</p>
                     )}
@@ -258,13 +264,16 @@ function PoolCard({ pool }: { pool: PoolView }) {
 function PositionPanel({
     user,
     position,
+    paused,
     onDone,
 }: {
     user: string;
     position: UserView | undefined;
+    paused: boolean;
     onDone: () => Promise<void>;
 }) {
-    const [mode, setMode] = useState<"deposit" | "withdraw">("deposit");
+    const [chosenMode, setMode] = useState<"deposit" | "withdraw">("deposit");
+    const mode = paused ? "withdraw" : chosenMode;
     const [input, setInput] = useState("");
     const [busy, setBusy] = useState(false);
     const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string; hash?: string }>();
@@ -312,6 +321,7 @@ function PositionPanel({
                         role="tab"
                         aria-selected={mode === tab}
                         className={mode === tab ? "tab active" : "tab"}
+                        disabled={paused && tab === "deposit"}
                         onClick={() => {
                             setMode(tab);
                             setMessage(undefined);
@@ -371,6 +381,10 @@ function ActivityList({ items }: { items: Activity[] }) {
                 return `Agent lent to Blend pool #${item.poolId}`;
             case "deallocated":
                 return `Vault took back from Blend pool #${item.poolId}`;
+            case "paused":
+                return "Admin paused the vault";
+            case "unpaused":
+                return "Admin reopened the vault";
         }
     };
     return (
@@ -379,7 +393,7 @@ function ActivityList({ items }: { items: Activity[] }) {
                 <li key={`${item.txHash}-${item.kind}-${item.poolId ?? item.account}`}>
                     <span className={`dot ${item.kind}`} aria-hidden />
                     <span className="activity-text">{describe(item)}</span>
-                    <span className="activity-amount">{xlm(item.amount)} XLM</span>
+                    <span className="activity-amount">{item.amount === undefined ? "" : `${xlm(item.amount)} XLM`}</span>
                     <a href={`${EXPLORER}/tx/${item.txHash}`} target="_blank" rel="noreferrer">
                         {timeAgo(item.time)}
                     </a>

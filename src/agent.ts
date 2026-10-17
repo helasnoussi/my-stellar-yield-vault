@@ -101,8 +101,10 @@ async function runAIAgentLoop() {
             (await simulate(new Contract(token), "balance", addressArg(vault.contractId()))) as bigint,
         );
         const pools = await loadPools(token);
+        const paused = Boolean(await simulate(vault, "is_paused"));
 
         console.log(`💰 Idle in vault: ${formatXlm(idle)}`);
+        if (paused) console.log("⏸️ Vault paused by the admin: no new allocations");
         for (const pool of pools) {
             const realized = pool.realized
                 ? `realized ${formatPercent(pool.realized.periodReturn * 10_000)} over ` +
@@ -118,7 +120,7 @@ async function runAIAgentLoop() {
             );
         }
 
-        const action = decideAction(idle, pools);
+        const action = decideAction(idle, pools, paused);
         if (action.kind === "hold") {
             console.log(`💤 Hold: ${action.reason}`);
             return;
@@ -146,7 +148,7 @@ function isEligible(pool: PoolState): boolean {
     );
 }
 
-function decideAction(idle: bigint, pools: PoolState[]): Action {
+function decideAction(idle: bigint, pools: PoolState[], paused: boolean): Action {
     const capped = (amount: bigint) => (amount > MAX_OPERATION ? MAX_OPERATION : amount);
 
     // 1. Exit pools that no longer pass the safety filters
@@ -179,6 +181,9 @@ function decideAction(idle: bigint, pools: PoolState[]): Action {
     }
 
     // 3. Put the excess above the reserve to work in the best eligible pool
+    if (paused) {
+        return { kind: "hold", reason: "vault paused, allocations disabled" };
+    }
     const excess = idle - IDLE_RESERVE;
     if (excess < MIN_ACTION) {
         return { kind: "hold", reason: "no excess above the idle reserve" };

@@ -13,6 +13,7 @@ approved, never to an arbitrary address.
 - **Withdrawals:** users withdraw XLM up to the value of their shares; if the vault's idle XLM is short, it pulls the difference back from Blend automatically.
 - **Blend allocation:** the agent lends idle XLM to admin-approved Blend pools as a plain supply (no collateral, no borrowing, so no liquidation risk).
 - **Guardrails in the contract:** only the configured agent can allocate, only to approved pools, at most 100 XLM per operation.
+- **Emergency pause:** the admin can pause deposits and allocations, and pull a whole pool position back into the vault; withdrawals always stay open.
 - **Yield measured, not just estimated:** the agent reports the pool's instant rate and the yield a Blend position actually earned over the last 7 days, and decides on the latter.
 - **Web app:** depositors connect Freighter, deposit and withdraw, and follow the funds lent on Blend, both yield figures and the agent's moves.
 - **Testnet verified:** deployed on Stellar Testnet, with unit tests and a test against a local copy of the real Blend testnet pool.
@@ -21,7 +22,7 @@ approved, never to an arbitrary address.
 
 ## Deployment Details (Stellar Testnet)
 
-- **Vault Contract ID:** `CDYRFTVVJNU25W54E2H42I2YLCR3SATYLWFON6LSBFGS5GHIB4QIXSGY`
+- **Vault Contract ID:** `CCVGGUNK35UNUDOODRSIWPNFQAF3VPBDP4WTAHEWOVQLS4NGWND3JA3T`
 - **Underlying Token (Native XLM):** `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`
 - **Admin Account:** `GBRHOUDYVMYERRSFYOELPSZMKSIAFAXHEGGGTLQ5YUZ7GXPQZ5I5R5WH`
 - **Agent Account:** `GAXWJXQG7LIZNU3HNLAEK5QA3T47I6TQELCOI6UOMIUMHJCHL2BOQIPJ`
@@ -39,10 +40,13 @@ approved, never to an arbitrary address.
 | `allocate(pool_id, amount)` / `deallocate(pool_id, amount)` | agent | Lends idle XLM to an approved pool / takes it back |
 | `total_assets()`, `pool_assets(pool_id)` | anyone | Idle XLM plus pool positions including interest / one pool's position |
 | `shares_of(owner)`, `balance_of(owner)` | anyone | A depositor's shares / their value in XLM |
-| `pools()`, `token()` | anyone | Approved pools / the vault token |
+| `pause()` / `unpause()` | admin | Blocks / reopens deposits and allocations; withdrawals and `deallocate` keep working |
+| `emergency_withdraw(pool_id)` | admin | Pulls the vault's whole position in a pool back into the vault, above the 100 XLM cap, and pauses the vault |
+| `pools()`, `token()`, `is_paused()` | anyone | Approved pools / the vault token / pause state |
 
 Every deposit, withdrawal, allocation and deallocation is capped at 100 XLM
-(`MAX_OPERATION_STROOPS`). Amounts are in stroops: `1000000000` stroops is
+(`MAX_OPERATION_STROOPS`); only `emergency_withdraw` goes above it, and the
+funds it pulls stay in the vault: the admin cannot receive them. Amounts are in stroops: `1000000000` stroops is
 `100 XLM`.
 
 ## Autonomous agent (`src/agent.ts`)
@@ -67,7 +71,8 @@ rate and says so in its log. The agent then takes one action:
    `MIN_APY_BPS`, or available liquidity below `MINIMUM_LIQUIDITY_STROOPS`);
 2. otherwise refill the idle reserve (`VAULT_IDLE_RESERVE_STROOPS`, 30 XLM by
    default) from the lowest-yield pool;
-3. otherwise lend the excess above the reserve to the best eligible pool.
+3. otherwise lend the excess above the reserve to the best eligible pool,
+   unless the vault is paused.
 
 Moves smaller than `MIN_ACTION_STROOPS` are skipped. The agent signs with
 `AGENT_SECRET_KEY` (falling back to `ADMIN_SECRET_KEY`), which must be the

@@ -396,3 +396,17 @@ h2 {
         grid-column: 2 / -1;
     }
 }
+
+.tab:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.dot.paused,
+.dot.unpaused {
+    background: var(--error);
+}
+
+.dot.unpaused {
+    background: var(--ok);
+}

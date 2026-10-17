@@ -22,7 +22,7 @@ import {
 } from "../src/blend-rates.js";
 
 export const CONTRACT_ID =
-    import.meta.env.VITE_CONTRACT_ID ?? "CDYRFTVVJNU25W54E2H42I2YLCR3SATYLWFON6LSBFGS5GHIB4QIXSGY";
+    import.meta.env.VITE_CONTRACT_ID ?? "CCVGGUNK35UNUDOODRSIWPNFQAF3VPBDP4WTAHEWOVQLS4NGWND3JA3T";
 export const RPC_URL = import.meta.env.VITE_RPC_URL ?? "https://soroban-testnet.stellar.org";
 export const NETWORK_PASSPHRASE = Networks.TESTNET;
 export const MAX_OPERATION_STROOPS = 1_000_000_000n;
@@ -49,6 +49,7 @@ export type PoolView = {
 
 export type VaultView = {
     token: string;
+    paused: boolean;
     totalAssets: bigint;
     idle: bigint;
     pools: PoolView[];
@@ -61,10 +62,10 @@ export type UserView = {
 };
 
 export type Activity = {
-    kind: "deposit" | "withdraw" | "allocated" | "deallocated";
+    kind: "deposit" | "withdraw" | "allocated" | "deallocated" | "paused" | "unpaused";
     account?: string;
     poolId?: number;
-    amount: bigint;
+    amount?: bigint;
     time: Date;
     txHash: string;
 };
@@ -87,10 +88,11 @@ const address = (value: string) => nativeToScVal(value, { type: "address" });
 
 export async function loadVault(): Promise<VaultView> {
     const token = String(await simulate(vault, "token"));
-    const [totalAssets, idle, registry] = await Promise.all([
+    const [totalAssets, idle, registry, paused] = await Promise.all([
         simulate(vault, "total_assets"),
         simulate(new Contract(token), "balance", address(CONTRACT_ID)),
         simulate(vault, "pools") as Promise<Record<string, string>>,
+        simulate(vault, "is_paused"),
     ]);
 
     const pools = await Promise.all(
@@ -121,7 +123,13 @@ export async function loadVault(): Promise<VaultView> {
         }),
     );
 
-    return { token, totalAssets: BigInt(totalAssets as bigint), idle: BigInt(idle as bigint), pools };
+    return {
+        token,
+        paused: Boolean(paused),
+        totalAssets: BigInt(totalAssets as bigint),
+        idle: BigInt(idle as bigint),
+        pools,
+    };
 }
 
 export async function loadUser(token: string, user: string): Promise<UserView> {
@@ -148,15 +156,14 @@ export async function loadActivity(): Promise<Activity[]> {
         .flatMap((event): Activity[] => {
             const [name, topic] = event.topic.map((part) => scValToNative(part) as unknown);
             const kind = String(name);
+            const when = { time: new Date(event.ledgerClosedAt), txHash: event.txHash };
+            if (kind === "paused") {
+                return [{ kind: scValToNative(event.value) ? "paused" : "unpaused", ...when }];
+            }
             if (kind !== "deposit" && kind !== "withdraw" && kind !== "allocated" && kind !== "deallocated") {
                 return [];
             }
-            const base = {
-                kind,
-                amount: BigInt(scValToNative(event.value) as bigint),
-                time: new Date(event.ledgerClosedAt),
-                txHash: event.txHash,
-            } as const;
+            const base = { kind, amount: BigInt(scValToNative(event.value) as bigint), ...when } as const;
             return kind === "deposit" || kind === "withdraw"
                 ? [{ ...base, account: String(topic) }]
                 : [{ ...base, poolId: Number(topic) }];
