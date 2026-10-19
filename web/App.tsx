@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { getAddress, getNetworkDetails, isAllowed, isConnected, requestAccess } from "@stellar/freighter-api";
+import {
+    WatchWalletChanges,
+    getAddress,
+    getNetworkDetails,
+    isAllowed,
+    isConnected,
+    requestAccess,
+} from "@stellar/freighter-api";
 import { formatDuration, formatPercent } from "../src/blend-rates.js";
 import {
     CONTRACT_ID,
@@ -9,8 +16,10 @@ import {
     loadActivity,
     loadUser,
     loadVault,
+    sendAdminCall,
     sendVaultCall,
     type Activity,
+    type AdminAction,
     type PoolView,
     type UserView,
     type VaultView,
@@ -42,7 +51,10 @@ function timeAgo(date: Date): string {
     if (seconds < 60) return "just now";
     if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
     if (seconds < 86_400) return `${Math.floor(seconds / 3600)} h ago`;
-    return `${Math.floor(seconds / 86_400)} d ago`;
+    // Past a day, count calendar days: the 17th seen on the 19th is "2 d ago"
+    const midnight = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const days = Math.round((midnight(new Date()) - midnight(date)) / 86_400_000);
+    return days === 1 ? "yesterday" : `${days} d ago`;
 }
 
 // ---------- App ----------
@@ -87,6 +99,30 @@ export function App() {
             }
         })();
     }, []);
+
+    // Follow account and network switches made in Freighter
+    useEffect(() => {
+        if (!user) return;
+        const watcher = new WatchWalletChanges(3000);
+        watcher.watch(({ address, networkPassphrase, error }) => {
+            if (error || !address) return;
+            if (networkPassphrase !== NETWORK_PASSPHRASE) {
+                setWalletIssue("Freighter is on another network: switch it to Testnet.");
+                return;
+            }
+            setWalletIssue(undefined);
+            if (address !== user) {
+                setPosition(undefined);
+                setUser(address);
+            }
+        });
+        return () => watcher.stop();
+    }, [user]);
+
+    function disconnect() {
+        setUser(undefined);
+        setPosition(undefined);
+    }
 
     async function adoptWallet(address: string) {
         const network = await getNetworkDetails();
@@ -133,7 +169,7 @@ export function App() {
                     <span className="pill">Testnet</span>
                 </div>
                 {user ? (
-                    <span className="wallet" title={user}>{short(user)}</span>
+                    <WalletMenu user={user} admin={vault?.admin} onDisconnect={disconnect} />
                 ) : (
                     <button className="button" onClick={() => void connect()} disabled={connecting}>
                         {connecting ? "Check Freighter…" : "Connect Freighter"}
@@ -189,6 +225,8 @@ export function App() {
                 </section>
             </div>
 
+            {user && vault && user === vault.admin && <AdminPanel admin={user} vault={vault} onDone={refresh} />}
+
             <section className="card">
                 <h2>Recent activity</h2>
                 {activity ? <ActivityList items={activity} /> : <Loading />}
@@ -201,6 +239,55 @@ export function App() {
                 </a>{" "}
                 · Rates are estimates from on-chain data, not guarantees.
             </footer>
+        </div>
+    );
+}
+
+function WalletMenu({ user, admin, onDisconnect }: { user: string; admin?: string; onDisconnect: () => void }) {
+    const [open, setOpen] = useState(false);
+    const isAdmin = user === admin;
+    const [copied, setCopied] = useState(false);
+
+    async function copy() {
+        await navigator.clipboard.writeText(user);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+    }
+
+    return (
+        <div className="wallet-menu">
+            <button className="wallet" title={user} aria-expanded={open} onClick={() => setOpen(!open)}>
+                {short(user)}
+                {isAdmin && <span className="pill">admin</span>} ▾
+            </button>
+            {open && (
+                <div className="menu" role="menu">
+                    <span className="menu-address">{user}</span>
+                    <button role="menuitem" onClick={() => void copy()}>
+                        {copied ? "Copied" : "Copy address"}
+                    </button>
+                    <a role="menuitem" href={`${EXPLORER}/account/${user}`} target="_blank" rel="noreferrer">
+                        View on Stellar Expert
+                    </a>
+                    {isAdmin ? (
+                        <a role="menuitem" href="#admin" onClick={() => setOpen(false)}>
+                            Go to admin panel
+                        </a>
+                    ) : (
+                        admin && <span className="menu-hint">Admin panel: select {short(admin)} in Freighter.</span>
+                    )}
+                    <span className="menu-hint">Switch accounts in Freighter: this page follows.</span>
+                    <button
+                        role="menuitem"
+                        onClick={() => {
+                            setOpen(false);
+                            onDisconnect();
+                        }}
+                    >
+                        Disconnect
+                    </button>
+                </div>
+            )}
         </div>
     );
 }
@@ -369,6 +456,92 @@ function PositionPanel({
     );
 }
 
+function AdminPanel({ admin, vault, onDone }: { admin: string; vault: VaultView; onDone: () => Promise<void> }) {
+    const [busy, setBusy] = useState<string>();
+    const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string; hash?: string }>();
+
+    async function run(label: string, action: AdminAction, confirmText?: string) {
+        if (confirmText && !window.confirm(confirmText)) return;
+        setBusy(label);
+        setMessage(undefined);
+        try {
+            const hash = await sendAdminCall(admin, action);
+            setMessage({ kind: "ok", text: `${label}: done.`, hash });
+            await onDone();
+        } catch (error) {
+            setMessage({ kind: "error", text: `${label}: ${error instanceof Error ? error.message : String(error)}` });
+        } finally {
+            setBusy(undefined);
+        }
+    }
+
+    return (
+        <section className="card admin" id="admin">
+            <h2>
+                Admin <span className="pill">{short(admin)}</span>
+            </h2>
+
+            <div className="admin-row">
+                <div>
+                    <strong>{vault.paused ? "Vault paused" : "Vault open"}</strong>
+                    <p className="muted small">
+                        Pausing blocks deposits and new Blend allocations. Withdrawals stay open.
+                    </p>
+                </div>
+                <button
+                    className={vault.paused ? "button" : "button danger"}
+                    disabled={busy !== undefined}
+                    onClick={() =>
+                        void (vault.paused
+                            ? run("Resume", { method: "unpause" })
+                            : run("Pause", { method: "pause" }, "Pause the vault? Deposits and allocations will be blocked."))
+                    }
+                >
+                    {busy === "Pause" || busy === "Resume" ? "Confirm in Freighter…" : vault.paused ? "Resume" : "Pause"}
+                </button>
+            </div>
+
+            <h3>Emergency withdraw</h3>
+            {vault.pools.length === 0 && <p className="muted small">No approved pool.</p>}
+            {vault.pools.map((pool) => (
+                <div className="admin-row" key={pool.id}>
+                    <div>
+                        <strong>Pool #{pool.id}</strong>{" "}
+                        <a href={`${EXPLORER}/contract/${pool.address}`} target="_blank" rel="noreferrer">
+                            {short(pool.address)}
+                        </a>
+                        <p className="muted small">Vault position {xlm(pool.position)} XLM</p>
+                    </div>
+                    <button
+                        className="button danger"
+                        disabled={busy !== undefined}
+                        onClick={() =>
+                            void run(
+                                `Emergency withdraw #${pool.id}`,
+                                { method: "emergency_withdraw", poolId: pool.id },
+                                `Pull the whole position of pool #${pool.id} back into the vault and pause it?`,
+                            )
+                        }
+                    >
+                        {busy === `Emergency withdraw #${pool.id}` ? "Confirm in Freighter…" : "Emergency withdraw"}
+                    </button>
+                </div>
+            ))}
+
+            {message && (
+                <p className={message.kind === "ok" ? "result ok" : "result error"}>
+                    {message.text}{" "}
+                    {message.hash && (
+                        <a href={`${EXPLORER}/tx/${message.hash}`} target="_blank" rel="noreferrer">
+                            View transaction
+                        </a>
+                    )}
+                </p>
+            )}
+        </section>
+    );
+}
+
 function ActivityList({ items }: { items: Activity[] }) {
     if (items.length === 0) return <p className="muted">No activity in the last 3 days.</p>;
     const describe = (item: Activity) => {
@@ -394,7 +567,7 @@ function ActivityList({ items }: { items: Activity[] }) {
                     <span className={`dot ${item.kind}`} aria-hidden />
                     <span className="activity-text">{describe(item)}</span>
                     <span className="activity-amount">{item.amount === undefined ? "" : `${xlm(item.amount)} XLM`}</span>
-                    <a href={`${EXPLORER}/tx/${item.txHash}`} target="_blank" rel="noreferrer">
+                    <a href={`${EXPLORER}/tx/${item.txHash}`} target="_blank" rel="noreferrer" title={item.time.toLocaleString()}>
                         {timeAgo(item.time)}
                     </a>
                 </li>

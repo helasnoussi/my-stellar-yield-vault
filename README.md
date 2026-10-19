@@ -225,6 +225,13 @@ To deposit from the page, Freighter needs a funded Testnet account:
 Use a regular account rather than the admin's: depositing and withdrawing need
 no special rights.
 
+When the connected account is the vault admin, an **Admin** panel appears:
+pause or resume the vault, and run `emergency_withdraw` on each approved pool.
+The page reads the admin address from the contract's instance storage, and
+follows account switches made in Freighter. To use it, import the admin's
+secret key (`stellar keys show <ADMIN_ALIAS>`, run outside any shared session)
+into Freighter as a separate account.
+
 ## Built with
 
 Built with [Claude Code](https://claude.com/claude-code) and
