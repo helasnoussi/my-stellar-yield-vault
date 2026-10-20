@@ -30,7 +30,7 @@ export const EXPLORER = "https://stellar.expert/explorer/testnet";
 
 const REALIZED_WINDOW_SECONDS = 7 * 86_400;
 const REALIZED_MIN_SECONDS = 3_600;
-const ACTIVITY_WINDOW_SECONDS = 3 * 86_400;
+const ACTIVITY_WINDOW_SECONDS = 7 * 86_400;
 
 const server = new rpc.Server(RPC_URL);
 const vault = new Contract(CONTRACT_ID);

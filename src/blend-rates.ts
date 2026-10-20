@@ -95,6 +95,8 @@ export function measureRealizedYield(
 
 // ~5 s per ledger
 export const LEDGERS_PER_DAY = 17_280;
+// ~5 min of ledgers
+const OLDEST_LEDGER_MARGIN = 60;
 
 // Events matching `filters` from `sinceSeconds` ago (capped to what the RPC keeps,
 // about 7 days). The RPC scans the ledger range in chunks: an empty page does not
@@ -108,7 +110,9 @@ export async function fetchEvents(
 ): Promise<rpc.Api.EventResponse[]> {
     const { oldestLedger, latestLedger } = await server.getHealth();
     const wanted = latestLedger - Math.ceil((sinceSeconds / 86_400) * LEDGERS_PER_DAY);
-    const startLedger = Math.max(oldestLedger + 1, wanted);
+    // The RPC prunes old ledgers continuously: a margin keeps startLedger in range
+    // by the time getEvents runs
+    const startLedger = Math.max(oldestLedger + OLDEST_LEDGER_MARGIN, wanted);
     const events: rpc.Api.EventResponse[] = [];
     let page = await server.getEvents({ startLedger, filters, limit: 200 });
     for (let i = 0; i < MAX_EVENT_PAGES; i++) {

@@ -543,7 +543,7 @@ function AdminPanel({ admin, vault, onDone }: { admin: string; vault: VaultView;
 }
 
 function ActivityList({ items }: { items: Activity[] }) {
-    if (items.length === 0) return <p className="muted">No activity in the last 3 days.</p>;
+    if (items.length === 0) return <p className="muted">No activity in the last 7 days.</p>;
     const describe = (item: Activity) => {
         switch (item.kind) {
             case "deposit":

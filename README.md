@@ -203,7 +203,7 @@ eval stellar contract invoke --id <CONTRACT_ID> --source-account <USER_ALIAS> $N
 A React page for depositors: connect [Freighter](https://www.freighter.app) on
 Testnet, deposit and withdraw XLM, and follow the vault's total assets, the
 funds lent on Blend, both yield figures (computed with the same code as the
-agent, `src/blend-rates.ts`) and the last 3 days of vault activity. Reading
+agent, `src/blend-rates.ts`) and the last 7 days of vault activity (what the RPC keeps). Reading
 works without a wallet.
 
 ```bash
