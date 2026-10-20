@@ -203,7 +203,7 @@ eval stellar contract invoke --id <CONTRACT_ID> --source-account <USER_ALIAS> $N
 A React page for depositors: connect [Freighter](https://www.freighter.app) on
 Testnet, deposit and withdraw XLM, and follow the vault's total assets, the
 funds lent on Blend, both yield figures (computed with the same code as the
-agent, `src/blend-rates.ts`) and the last 3 days of vault activity. Reading
+agent, `src/blend-rates.ts`) and the last 7 days of vault activity (what the RPC keeps). Reading
 works without a wallet.
 
 ```bash
@@ -224,6 +224,13 @@ To deposit from the page, Freighter needs a funded Testnet account:
 
 Use a regular account rather than the admin's: depositing and withdrawing need
 no special rights.
+
+When the connected account is the vault admin, an **Admin** panel appears:
+pause or resume the vault, and run `emergency_withdraw` on each approved pool.
+The page reads the admin address from the contract's instance storage, and
+follows account switches made in Freighter. To use it, import the admin's
+secret key (`stellar keys show <ADMIN_ALIAS>`, run outside any shared session)
+into Freighter as a separate account.
 
 ## Built with
 

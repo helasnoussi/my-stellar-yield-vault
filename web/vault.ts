@@ -9,7 +9,7 @@ import {
     nativeToScVal,
     rpc,
     scValToNative,
-    type xdr,
+    xdr,
 } from "@stellar/stellar-sdk";
 import { signTransaction } from "@stellar/freighter-api";
 import {
@@ -30,7 +30,7 @@ export const EXPLORER = "https://stellar.expert/explorer/testnet";
 
 const REALIZED_WINDOW_SECONDS = 7 * 86_400;
 const REALIZED_MIN_SECONDS = 3_600;
-const ACTIVITY_WINDOW_SECONDS = 3 * 86_400;
+const ACTIVITY_WINDOW_SECONDS = 7 * 86_400;
 
 const server = new rpc.Server(RPC_URL);
 const vault = new Contract(CONTRACT_ID);
@@ -49,6 +49,7 @@ export type PoolView = {
 
 export type VaultView = {
     token: string;
+    admin: string;
     paused: boolean;
     totalAssets: bigint;
     idle: bigint;
@@ -85,9 +86,30 @@ async function simulate(contract: Contract, method: string, ...args: xdr.ScVal[]
 }
 
 const address = (value: string) => nativeToScVal(value, { type: "address" });
+const poolIdVal = (poolId: number) => nativeToScVal(poolId, { type: "u32" });
+
+// The contract has no admin() getter: read DataKey::Admin from its instance storage
+async function readAdmin(): Promise<string> {
+    const entry = await server.getContractData(
+        CONTRACT_ID,
+        xdr.ScVal.scvLedgerKeyContractInstance(),
+        rpc.Durability.Persistent,
+    );
+    const data = entry.val;
+    if (data.type !== "contractData" || data.contractData.val.type !== "scvContractInstance") {
+        throw new Error("Unexpected vault instance entry");
+    }
+    const admin = (data.contractData.val.instance.storage ?? []).find((item) => {
+        const key = scValToNative(item.key) as unknown;
+        return Array.isArray(key) && key[0] === "Admin";
+    });
+    if (!admin) throw new Error("Admin not found in the vault storage");
+    return String(scValToNative(admin.val));
+}
 
 export async function loadVault(): Promise<VaultView> {
-    const token = String(await simulate(vault, "token"));
+    const [tokenId, admin] = await Promise.all([simulate(vault, "token"), readAdmin()]);
+    const token = String(tokenId);
     const [totalAssets, idle, registry, paused] = await Promise.all([
         simulate(vault, "total_assets"),
         simulate(new Contract(token), "balance", address(CONTRACT_ID)),
@@ -101,7 +123,7 @@ export async function loadVault(): Promise<VaultView> {
             const [reserve, config, position, samples] = await Promise.all([
                 simulate(pool, "get_reserve", address(token)) as Promise<BlendReserve>,
                 simulate(pool, "get_config") as Promise<{ bstop_rate: number }>,
-                simulate(vault, "pool_assets", nativeToScVal(Number(id), { type: "u32" })),
+                simulate(vault, "pool_assets", poolIdVal(Number(id))),
                 loadEventSamples(server, poolAddress, token, REALIZED_WINDOW_SECONDS),
             ]);
             const current = { time: Number(reserve.data.last_time), bRate: BigInt(reserve.data.b_rate) };
@@ -125,6 +147,7 @@ export async function loadVault(): Promise<VaultView> {
 
     return {
         token,
+        admin,
         paused: Boolean(paused),
         totalAssets: BigInt(totalAssets as bigint),
         idle: BigInt(idle as bigint),
@@ -172,17 +195,17 @@ export async function loadActivity(): Promise<Activity[]> {
 }
 
 // Builds, simulates, has Freighter sign, sends, and waits for confirmation
-export async function sendVaultCall(user: string, method: "deposit" | "withdraw", amount: bigint) {
-    const account = await server.getAccount(user);
+async function signAndSend(source: string, operation: xdr.Operation) {
+    const account = await server.getAccount(source);
     const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASE })
-        .addOperation(vault.call(method, address(user), nativeToScVal(amount, { type: "i128" })))
+        .addOperation(operation)
         .setTimeout(120)
         .build();
     const prepared = await server.prepareTransaction(tx);
 
     const signed = await signTransaction(prepared.toXDR(), {
         networkPassphrase: NETWORK_PASSPHRASE,
-        address: user,
+        address: source,
     });
     if (signed.error) throw new Error(signed.error.message ?? "Signature refused");
 
@@ -197,4 +220,17 @@ export async function sendVaultCall(user: string, method: "deposit" | "withdraw"
         throw new Error(`Transaction failed (${result.status})`);
     }
     return response.hash;
+}
+
+export function sendVaultCall(user: string, method: "deposit" | "withdraw", amount: bigint) {
+    return signAndSend(user, vault.call(method, address(user), nativeToScVal(amount, { type: "i128" })));
+}
+
+export type AdminAction = { method: "pause" | "unpause" } | { method: "emergency_withdraw"; poolId: number };
+
+// Admin-only calls: the contract rejects them unless `admin` signs
+export function sendAdminCall(admin: string, action: AdminAction) {
+    return action.method === "emergency_withdraw"
+        ? signAndSend(admin, vault.call(action.method, poolIdVal(action.poolId)))
+        : signAndSend(admin, vault.call(action.method));
 }
