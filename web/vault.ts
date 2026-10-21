@@ -8,6 +8,8 @@ import {
     Networks,
     nativeToScVal,
     rpc,
+    type Operation,
+    type Transaction,
     scValToNative,
     xdr,
 } from "@stellar/stellar-sdk";
@@ -67,6 +69,9 @@ export type Activity = {
     account?: string;
     poolId?: number;
     amount?: bigint;
+    // Who triggered a deallocation: the agent, the admin's emergency withdraw,
+    // or a user withdrawal that needed more than the idle funds
+    by?: "agent" | "admin" | "withdrawal";
     time: Date;
     txHash: string;
 };
@@ -175,7 +180,7 @@ export async function loadActivity(): Promise<Activity[]> {
         [{ type: "contract", contractIds: [CONTRACT_ID] }],
         ACTIVITY_WINDOW_SECONDS,
     );
-    return events
+    const activity = events
         .flatMap((event): Activity[] => {
             const [name, topic] = event.topic.map((part) => scValToNative(part) as unknown);
             const kind = String(name);
@@ -192,6 +197,38 @@ export async function loadActivity(): Promise<Activity[]> {
                 : [{ ...base, poolId: Number(topic) }];
         })
         .reverse();
+
+    // deallocate, emergency_withdraw and withdraw all emit Deallocated: the
+    // other events of the same transaction usually tell them apart
+    const kindsByTx = new Map<string, Set<Activity["kind"]>>();
+    for (const item of activity) {
+        kindsByTx.set(item.txHash, (kindsByTx.get(item.txHash) ?? new Set()).add(item.kind));
+    }
+    await Promise.all(
+        activity
+            .filter((item) => item.kind === "deallocated")
+            .map(async (item) => {
+                const kinds = kindsByTx.get(item.txHash)!;
+                if (kinds.has("withdraw")) item.by = "withdrawal";
+                else if (kinds.has("paused")) item.by = "admin";
+                // An emergency withdraw on an already paused vault emits no Paused event
+                else item.by = (await calledFunction(item.txHash)) === "emergency_withdraw" ? "admin" : "agent";
+            }),
+    );
+    return activity;
+}
+
+// Name of the contract function a transaction invoked, if the RPC still has it
+async function calledFunction(txHash: string): Promise<string | undefined> {
+    try {
+        const tx = await server.getTransaction(txHash);
+        if (tx.status === rpc.Api.GetTransactionStatus.NOT_FOUND) return undefined;
+        const { func } = (TransactionBuilder.fromXDR(tx.envelopeXdr, NETWORK_PASSPHRASE) as Transaction)
+            .operations[0] as Operation.InvokeHostFunction;
+        return func.type === "hostFunctionTypeInvokeContract" ? func.invokeContract.functionName.toString() : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 // Builds, simulates, has Freighter sign, sends, and waits for confirmation

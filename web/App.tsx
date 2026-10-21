@@ -553,7 +553,9 @@ function ActivityList({ items }: { items: Activity[] }) {
             case "allocated":
                 return `Agent lent to Blend pool #${item.poolId}`;
             case "deallocated":
-                return `Vault took back from Blend pool #${item.poolId}`;
+                if (item.by === "admin") return `Admin emergency-withdrew from Blend pool #${item.poolId}`;
+                if (item.by === "withdrawal") return `Vault took back from Blend pool #${item.poolId} to pay a withdrawal`;
+                return `Agent took back from Blend pool #${item.poolId}`;
             case "paused":
                 return "Admin paused the vault";
             case "unpaused":
