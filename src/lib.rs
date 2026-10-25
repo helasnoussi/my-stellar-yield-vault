@@ -1,8 +1,8 @@
 #![no_std]
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
-    contract, contractevent, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal,
-    Map, Vec,
+    contract, contractevent, contractimpl, contracttype, symbol_short, token::TokenInterface, vec,
+    Address, Env, IntoVal, Map, MuxedAddress, String, Vec,
 };
 
 mod blend;
@@ -26,6 +26,19 @@ pub enum DataKey {
     Agent,
     Pools, // Map<u32, Address> des pools Blend autorisés par l'admin
     Paused,
+    Allowance(AllowanceKey),
+}
+
+#[contracttype]
+pub struct AllowanceKey {
+    pub from: Address,
+    pub spender: Address,
+}
+
+#[contracttype]
+pub struct AllowanceValue {
+    pub amount: i128,
+    pub live_until_ledger: u32,
 }
 
 #[contractevent(data_format = "single-value")]
@@ -59,6 +72,50 @@ pub struct Deallocated {
 #[contractevent(data_format = "single-value")]
 pub struct Paused {
     pub paused: bool,
+}
+
+// Événements standard SEP-41 : les montants sont des parts svXLM
+#[contractevent(data_format = "single-value")]
+pub struct Transfer {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+}
+
+#[contractevent(topics = ["transfer"])]
+pub struct TransferMuxed {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub to: Address,
+    pub to_muxed_id: u64,
+    pub amount: i128,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct Approve {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub spender: Address,
+    pub amount: i128,
+    pub live_until_ledger: u32,
+}
+
+#[contractevent(data_format = "single-value")]
+pub struct Mint {
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+}
+
+#[contractevent(data_format = "single-value")]
+pub struct Burn {
+    #[topic]
+    pub from: Address,
+    pub amount: i128,
 }
 
 #[contract]
@@ -158,14 +215,11 @@ impl YieldVault {
 
         Self::token_client(&env).transfer(&from, &env.current_contract_address(), &amount);
 
-        let key = DataKey::UserShare(from.clone());
-        let user_shares: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(user_shares + minted));
-        Self::extend_persistent(&env, &key);
-
+        Self::write_shares(&env, &from, Self::read_shares(&env, &from) + minted);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares + minted));
         Self::extend_instance(&env);
 
+        Mint { to: from.clone(), amount: minted }.publish(&env);
         Deposit { from, amount }.publish(&env);
     }
 
@@ -179,21 +233,20 @@ impl YieldVault {
         let total_shares = Self::total_shares(&env);
         let burned = Self::div_ceil(amount * (total_shares + 1), total_assets + 1);
 
-        let key = DataKey::UserShare(to.clone());
-        let user_shares: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let user_shares = Self::read_shares(&env, &to);
         if user_shares < burned {
             panic!("Insufficient shares");
         }
 
         // Mise à jour de l'état avant tout appel externe
-        env.storage().persistent().set(&key, &(user_shares - burned));
-        Self::extend_persistent(&env, &key);
+        Self::write_shares(&env, &to, user_shares - burned);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares - burned));
         Self::extend_instance(&env);
 
         Self::ensure_liquidity(&env, amount);
         Self::token_client(&env).transfer(&env.current_contract_address(), &to, &amount);
 
+        Burn { from: to.clone(), amount: burned }.publish(&env);
         Withdraw { to, amount }.publish(&env);
     }
 
@@ -251,8 +304,8 @@ impl YieldVault {
         shares
     }
 
-    // Valeur en XLM des parts d'un déposant
-    pub fn balance_of(env: Env, owner: Address) -> i128 {
+    // Valeur en XLM des parts d'un déposant (balance renvoie les parts)
+    pub fn value_of(env: Env, owner: Address) -> i128 {
         let shares = Self::shares_of(env.clone(), owner);
         shares * (Self::total_assets(env.clone()) + 1) / (Self::total_shares(&env) + 1)
     }
@@ -330,6 +383,74 @@ impl YieldVault {
         env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0)
     }
 
+    fn read_shares(env: &Env, owner: &Address) -> i128 {
+        env.storage().persistent().get(&DataKey::UserShare(owner.clone())).unwrap_or(0)
+    }
+
+    // Prolonge le TTL de chaque compte modifié, destinataire compris
+    fn write_shares(env: &Env, owner: &Address, shares: i128) {
+        let key = DataKey::UserShare(owner.clone());
+        env.storage().persistent().set(&key, &shares);
+        Self::extend_persistent(env, &key);
+    }
+
+    fn move_shares(env: &Env, from: &Address, to: &Address, amount: i128) {
+        Self::require_nonnegative(amount);
+        let from_shares = Self::read_shares(env, from);
+        if from_shares < amount {
+            panic!("Insufficient shares");
+        }
+        Self::write_shares(env, from, from_shares - amount);
+        Self::write_shares(env, to, Self::read_shares(env, to) + amount);
+        Self::extend_instance(env);
+    }
+
+    // Brûler des parts sans retirer les XLM donne leur valeur aux autres déposants
+    fn burn_shares(env: &Env, from: &Address, amount: i128) {
+        Self::require_nonnegative(amount);
+        let from_shares = Self::read_shares(env, from);
+        if from_shares < amount {
+            panic!("Insufficient shares");
+        }
+        Self::write_shares(env, from, from_shares - amount);
+        let total_shares = Self::total_shares(env);
+        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - amount));
+        Self::extend_instance(env);
+        Burn { from: from.clone(), amount }.publish(env);
+    }
+
+    fn read_allowance(env: &Env, from: &Address, spender: &Address) -> AllowanceValue {
+        let key = DataKey::Allowance(AllowanceKey { from: from.clone(), spender: spender.clone() });
+        match env.storage().temporary().get::<_, AllowanceValue>(&key) {
+            Some(allowance) if allowance.live_until_ledger >= env.ledger().sequence() => allowance,
+            _ => AllowanceValue { amount: 0, live_until_ledger: 0 },
+        }
+    }
+
+    fn write_allowance(env: &Env, from: &Address, spender: &Address, amount: i128, live_until_ledger: u32) {
+        let ledger = env.ledger().sequence();
+        if amount > 0 && live_until_ledger < ledger {
+            panic!("Allowance expiration is in the past");
+        }
+        let key = DataKey::Allowance(AllowanceKey { from: from.clone(), spender: spender.clone() });
+        env.storage().temporary().set(&key, &AllowanceValue { amount, live_until_ledger });
+        if amount > 0 {
+            let live_for = live_until_ledger - ledger;
+            env.storage().temporary().extend_ttl(&key, live_for, live_for);
+        }
+    }
+
+    fn spend_allowance(env: &Env, from: &Address, spender: &Address, amount: i128) {
+        Self::require_nonnegative(amount);
+        let allowance = Self::read_allowance(env, from, spender);
+        if allowance.amount < amount {
+            panic!("Insufficient allowance");
+        }
+        if amount > 0 {
+            Self::write_allowance(env, from, spender, allowance.amount - amount, allowance.live_until_ledger);
+        }
+    }
+
     fn pool_address(env: &Env, pool_id: u32) -> Address {
         Self::pools(env.clone()).get(pool_id).expect("Unknown pool")
     }
@@ -390,6 +511,12 @@ impl YieldVault {
         env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
+    fn require_nonnegative(amount: i128) {
+        if amount < 0 {
+            panic!("Amount must not be negative");
+        }
+    }
+
     fn validate_operation_amount(amount: i128) {
         if amount <= 0 {
             panic!("Operation amount must be positive");
@@ -397,6 +524,71 @@ impl YieldVault {
         if amount > MAX_OPERATION_STROOPS {
             panic!("Operation amount exceeds 100 XLM limit");
         }
+    }
+}
+
+// Les parts du vault sont un token SEP-41, svXLM. Le rendement fait monter
+// la valeur de chaque part, pas leur nombre. Les transferts restent ouverts
+// pendant une pause, comme les retraits, et ne sont pas plafonnés à 100 XLM :
+// ils ne font sortir aucun XLM du vault.
+#[contractimpl]
+impl TokenInterface for YieldVault {
+    fn allowance(env: Env, from: Address, spender: Address) -> i128 {
+        Self::read_allowance(&env, &from, &spender).amount
+    }
+
+    fn approve(env: Env, from: Address, spender: Address, amount: i128, live_until_ledger: u32) {
+        from.require_auth();
+        Self::require_nonnegative(amount);
+        Self::write_allowance(&env, &from, &spender, amount, live_until_ledger);
+        Self::extend_instance(&env);
+        Approve { from, spender, amount, live_until_ledger }.publish(&env);
+    }
+
+    fn balance(env: Env, id: Address) -> i128 {
+        Self::shares_of(env, id)
+    }
+
+    fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
+        from.require_auth();
+        let to_address = to.address();
+        Self::move_shares(&env, &from, &to_address, amount);
+        match to.id() {
+            Some(to_muxed_id) => {
+                TransferMuxed { from, to: to_address, to_muxed_id, amount }.publish(&env)
+            }
+            None => Transfer { from, to: to_address, amount }.publish(&env),
+        }
+    }
+
+    fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        Self::spend_allowance(&env, &from, &spender, amount);
+        Self::move_shares(&env, &from, &to, amount);
+        Transfer { from, to, amount }.publish(&env);
+    }
+
+    fn burn(env: Env, from: Address, amount: i128) {
+        from.require_auth();
+        Self::burn_shares(&env, &from, amount);
+    }
+
+    fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
+        spender.require_auth();
+        Self::spend_allowance(&env, &from, &spender, amount);
+        Self::burn_shares(&env, &from, amount);
+    }
+
+    fn decimals(_env: Env) -> u32 {
+        7
+    }
+
+    fn name(env: Env) -> String {
+        String::from_str(&env, "Stellar Yield Vault XLM")
+    }
+
+    fn symbol(env: Env) -> String {
+        String::from_str(&env, "svXLM")
     }
 }
 

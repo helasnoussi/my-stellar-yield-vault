@@ -274,6 +274,14 @@ h2 {
     background: var(--surface);
 }
 
+.amount.recipient {
+    margin-bottom: 0.5rem;
+}
+
+.amount.recipient input {
+    font-size: 0.95rem;
+}
+
 .amount input {
     flex: 1;
     min-width: 0;
@@ -432,6 +440,10 @@ h2 {
 .dot.allocated,
 .dot.deallocated {
     background: var(--accent);
+}
+
+.dot.transfer {
+    background: var(--text);
 }
 
 .footer {
