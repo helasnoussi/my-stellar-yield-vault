@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import {
     WatchWalletChanges,
+    addToken,
     getAddress,
     getNetworkDetails,
     isAllowed,
     isConnected,
     requestAccess,
 } from "@stellar/freighter-api";
+import { StrKey } from "@stellar/stellar-sdk";
 import { formatDuration, formatPercent } from "../src/blend-rates.js";
 import {
     CONTRACT_ID,
@@ -17,6 +19,7 @@ import {
     loadUser,
     loadVault,
     sendAdminCall,
+    sendShares,
     sendVaultCall,
     type Activity,
     type AdminAction,
@@ -183,7 +186,8 @@ export function App() {
                     An autonomous agent lends the vault's idle XLM to approved{" "}
                     <a href="https://www.blend.capital" target="_blank" rel="noreferrer">Blend</a> pools.
                     The smart contract limits what it can do: approved pools only, 100 XLM per operation,
-                    and never to another address.
+                    and never to another address. Your shares are svXLM, a standard Stellar token you can
+                    hold in Freighter and send to anyone.
                 </p>
             </section>
 
@@ -359,8 +363,8 @@ function PositionPanel({
     paused: boolean;
     onDone: () => Promise<void>;
 }) {
-    const [chosenMode, setMode] = useState<"deposit" | "withdraw">("deposit");
-    const mode = paused ? "withdraw" : chosenMode;
+    const [chosenMode, setMode] = useState<"deposit" | "withdraw" | "send">("deposit");
+    const mode = paused && chosenMode === "deposit" ? "withdraw" : chosenMode;
     const [input, setInput] = useState("");
     const [busy, setBusy] = useState(false);
     const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string; hash?: string }>();
@@ -375,7 +379,7 @@ function PositionPanel({
     const sharePrice = position.shares > 0n ? Number(position.value) / Number(position.shares) : undefined;
 
     async function submit() {
-        if (amount === undefined) return;
+        if (amount === undefined || mode === "send") return;
         setBusy(true);
         setMessage(undefined);
         try {
@@ -395,14 +399,15 @@ function PositionPanel({
             <div className="position">
                 <span className="position-value">{xlm(position.value, 4)} XLM</span>
                 <span className="muted">
-                    {position.shares.toLocaleString("en-US")} shares
-                    {sharePrice !== undefined && ` · 1 share = ${sharePrice.toFixed(7)} XLM`}
+                    {xlm(position.shares, 4)} svXLM
+                    {sharePrice !== undefined && ` · 1 svXLM = ${sharePrice.toFixed(7)} XLM`}
                 </span>
                 <span className="muted">Wallet: {xlm(position.walletBalance)} XLM</span>
+                <AddTokenButton />
             </div>
 
             <div className="tabs" role="tablist">
-                {(["deposit", "withdraw"] as const).map((tab) => (
+                {(["deposit", "withdraw", "send"] as const).map((tab) => (
                     <button
                         key={tab}
                         role="tab"
@@ -414,11 +419,124 @@ function PositionPanel({
                             setMessage(undefined);
                         }}
                     >
-                        {tab === "deposit" ? "Deposit" : "Withdraw"}
+                        {tab === "deposit" ? "Deposit" : tab === "withdraw" ? "Withdraw" : "Send svXLM"}
                     </button>
                 ))}
             </div>
 
+            {mode === "send" ? (
+                <SendSharesForm user={user} position={position} onDone={onDone} />
+            ) : (
+                <>
+                    <div className="amount">
+                        <input
+                            inputMode="decimal"
+                            placeholder="0.00"
+                            value={input}
+                            onChange={(event) => setInput(event.target.value)}
+                            disabled={busy}
+                            aria-label="Amount in XLM"
+                        />
+                        <span>XLM</span>
+                        <button className="link" onClick={() => setInput(String(Number(max) / 1e7))} disabled={busy}>
+                            Max
+                        </button>
+                    </div>
+                    <p className="muted small">
+                        Up to {xlm(max)} XLM per operation.
+                        {mode === "withdraw" && " If the reserve is short, the vault pulls the rest from Blend."}
+                    </p>
+
+                    <button className="button wide" onClick={() => void submit()} disabled={busy || invalid}>
+                        {busy ? "Confirm in Freighter…" : mode === "deposit" ? "Deposit" : "Withdraw"}
+                    </button>
+
+                    {message && <Result message={message} />}
+                </>
+            )}
+        </>
+    );
+}
+
+function Result({ message }: { message: { kind: "ok" | "error"; text: string; hash?: string } }) {
+    return (
+        <p className={message.kind === "ok" ? "result ok" : "result error"}>
+            {message.text}{" "}
+            {message.hash && (
+                <a href={`${EXPLORER}/tx/${message.hash}`} target="_blank" rel="noreferrer">
+                    View transaction
+                </a>
+            )}
+        </p>
+    );
+}
+
+// Freighter lists any SEP-41 token once its contract is added
+function AddTokenButton() {
+    const [status, setStatus] = useState<string>();
+
+    async function add() {
+        setStatus(undefined);
+        try {
+            const result = await addToken({ contractId: CONTRACT_ID, networkPassphrase: NETWORK_PASSPHRASE });
+            setStatus(result.error ? result.error.message ?? "Refused in Freighter" : "svXLM added to Freighter");
+        } catch (error) {
+            setStatus(error instanceof Error ? error.message : String(error));
+        }
+    }
+
+    return (
+        <span className="muted small">
+            <button className="link" onClick={() => void add()}>
+                Add svXLM to Freighter
+            </button>
+            {status && ` · ${status}`}
+        </span>
+    );
+}
+
+// Transfers stay open while the vault is paused, and are not capped:
+// no XLM leaves the vault
+function SendSharesForm({ user, position, onDone }: { user: string; position: UserView; onDone: () => Promise<void> }) {
+    const [recipient, setRecipient] = useState("");
+    const [input, setInput] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string; hash?: string }>();
+
+    const to = recipient.trim();
+    const validRecipient = (StrKey.isValidEd25519PublicKey(to) || StrKey.isValidContract(to)) && to !== user;
+    const shares = parseXlm(input);
+    const invalid = !validRecipient || shares === undefined || shares > position.shares;
+    const worth = shares !== undefined && position.shares > 0n ? (shares * position.value) / position.shares : undefined;
+
+    async function submit() {
+        if (shares === undefined) return;
+        setBusy(true);
+        setMessage(undefined);
+        try {
+            const hash = await sendShares(user, to, shares);
+            setMessage({ kind: "ok", text: `Sent ${xlm(shares, 4)} svXLM to ${short(to)}.`, hash });
+            setInput("");
+            await onDone();
+        } catch (error) {
+            setMessage({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    return (
+        <>
+            <div className="amount recipient">
+                <input
+                    placeholder="Recipient G… address"
+                    value={recipient}
+                    onChange={(event) => setRecipient(event.target.value)}
+                    disabled={busy}
+                    aria-label="Recipient address"
+                    spellCheck={false}
+                />
+            </div>
             <div className="amount">
                 <input
                     inputMode="decimal"
@@ -426,32 +544,24 @@ function PositionPanel({
                     value={input}
                     onChange={(event) => setInput(event.target.value)}
                     disabled={busy}
-                    aria-label="Amount in XLM"
+                    aria-label="Amount in svXLM"
                 />
-                <span>XLM</span>
-                <button className="link" onClick={() => setInput(String(Number(max) / 1e7))} disabled={busy}>
+                <span>svXLM</span>
+                <button className="link" onClick={() => setInput(String(Number(position.shares) / 1e7))} disabled={busy}>
                     Max
                 </button>
             </div>
             <p className="muted small">
-                Up to {xlm(max)} XLM per operation.
-                {mode === "withdraw" && " If the reserve is short, the vault pulls the rest from Blend."}
+                {worth !== undefined ? `Worth ${xlm(worth, 4)} XLM today. ` : ""}
+                The recipient keeps earning the yield and can withdraw it.
+                {to !== "" && !validRecipient && " Enter another Stellar address."}
             </p>
 
             <button className="button wide" onClick={() => void submit()} disabled={busy || invalid}>
-                {busy ? "Confirm in Freighter…" : mode === "deposit" ? "Deposit" : "Withdraw"}
+                {busy ? "Confirm in Freighter…" : "Send svXLM"}
             </button>
 
-            {message && (
-                <p className={message.kind === "ok" ? "result ok" : "result error"}>
-                    {message.text}{" "}
-                    {message.hash && (
-                        <a href={`${EXPLORER}/tx/${message.hash}`} target="_blank" rel="noreferrer">
-                            View transaction
-                        </a>
-                    )}
-                </p>
-            )}
+            {message && <Result message={message} />}
         </>
     );
 }
@@ -560,6 +670,8 @@ function ActivityList({ items }: { items: Activity[] }) {
                 return "Admin paused the vault";
             case "unpaused":
                 return "Admin reopened the vault";
+            case "transfer":
+                return `${short(item.account ?? "")} sent svXLM to ${short(item.to ?? "")}`;
         }
     };
     return (
@@ -568,7 +680,9 @@ function ActivityList({ items }: { items: Activity[] }) {
                 <li key={`${item.txHash}-${item.kind}-${item.poolId ?? item.account}`}>
                     <span className={`dot ${item.kind}`} aria-hidden />
                     <span className="activity-text">{describe(item)}</span>
-                    <span className="activity-amount">{item.amount === undefined ? "" : `${xlm(item.amount)} XLM`}</span>
+                    <span className="activity-amount">
+                        {item.amount === undefined ? "" : `${xlm(item.amount)} ${item.kind === "transfer" ? "svXLM" : "XLM"}`}
+                    </span>
                     <a href={`${EXPLORER}/tx/${item.txHash}`} target="_blank" rel="noreferrer" title={item.time.toLocaleString()}>
                         {timeAgo(item.time)}
                     </a>

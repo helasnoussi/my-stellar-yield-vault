@@ -24,7 +24,7 @@ import {
 } from "../src/blend-rates.js";
 
 export const CONTRACT_ID =
-    import.meta.env.VITE_CONTRACT_ID ?? "CCVGGUNK35UNUDOODRSIWPNFQAF3VPBDP4WTAHEWOVQLS4NGWND3JA3T";
+    import.meta.env.VITE_CONTRACT_ID ?? "CCFMO6ZSC3ENVKDCNXLYSUTLGPVLWAKCM6CZPCYXTBRHIQVI3KMWYOHM";
 export const RPC_URL = import.meta.env.VITE_RPC_URL ?? "https://soroban-testnet.stellar.org";
 export const NETWORK_PASSPHRASE = Networks.TESTNET;
 export const MAX_OPERATION_STROOPS = 1_000_000_000n;
@@ -65,8 +65,10 @@ export type UserView = {
 };
 
 export type Activity = {
-    kind: "deposit" | "withdraw" | "allocated" | "deallocated" | "paused" | "unpaused";
+    kind: "deposit" | "withdraw" | "allocated" | "deallocated" | "paused" | "unpaused" | "transfer";
     account?: string;
+    // Recipient of a svXLM transfer; its amount is in shares, not XLM
+    to?: string;
     poolId?: number;
     amount?: bigint;
     // Who triggered a deallocation: the agent, the admin's emergency withdraw,
@@ -163,8 +165,8 @@ export async function loadVault(): Promise<VaultView> {
 export async function loadUser(token: string, user: string): Promise<UserView> {
     const [walletBalance, shares, value] = await Promise.all([
         simulate(new Contract(token), "balance", address(user)),
-        simulate(vault, "shares_of", address(user)),
-        simulate(vault, "balance_of", address(user)),
+        simulate(vault, "balance", address(user)),
+        simulate(vault, "value_of", address(user)),
     ]);
     return {
         walletBalance: BigInt(walletBalance as bigint),
@@ -173,7 +175,7 @@ export async function loadUser(token: string, user: string): Promise<UserView> {
     };
 }
 
-// Deposit, Withdraw, Allocated and Deallocated events of the last few days
+// Deposit, Withdraw, Allocated, Deallocated and svXLM Transfer events of the last few days
 export async function loadActivity(): Promise<Activity[]> {
     const events = await fetchEvents(
         server,
@@ -182,11 +184,17 @@ export async function loadActivity(): Promise<Activity[]> {
     );
     const activity = events
         .flatMap((event): Activity[] => {
-            const [name, topic] = event.topic.map((part) => scValToNative(part) as unknown);
+            const [name, topic, to] = event.topic.map((part) => scValToNative(part) as unknown);
             const kind = String(name);
             const when = { time: new Date(event.ledgerClosedAt), txHash: event.txHash };
             if (kind === "paused") {
                 return [{ kind: scValToNative(event.value) ? "paused" : "unpaused", ...when }];
+            }
+            if (kind === "transfer") {
+                // A transfer to a muxed address carries { amount, to_muxed_id }
+                const value = scValToNative(event.value) as bigint | { amount: bigint };
+                const amount = BigInt(typeof value === "object" ? value.amount : value);
+                return [{ kind, account: String(topic), to: String(to), amount, ...when }];
             }
             if (kind !== "deposit" && kind !== "withdraw" && kind !== "allocated" && kind !== "deallocated") {
                 return [];
@@ -261,6 +269,11 @@ async function signAndSend(source: string, operation: xdr.Operation) {
 
 export function sendVaultCall(user: string, method: "deposit" | "withdraw", amount: bigint) {
     return signAndSend(user, vault.call(method, address(user), nativeToScVal(amount, { type: "i128" })));
+}
+
+// Sends svXLM shares to another account; their yield keeps accruing to the recipient
+export function sendShares(user: string, to: string, shares: bigint) {
+    return signAndSend(user, vault.call("transfer", address(user), address(to), nativeToScVal(shares, { type: "i128" })));
 }
 
 export type AdminAction = { method: "pause" | "unpause" } | { method: "emergency_withdraw"; poolId: number };
