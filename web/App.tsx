@@ -108,7 +108,14 @@ export function App() {
         if (!user) return;
         const watcher = new WatchWalletChanges(3000);
         watcher.watch(({ address, networkPassphrase, error }) => {
-            if (error || !address) return;
+            if (error) return;
+            // Freighter only shares accounts that were connected to this site
+            if (!address) {
+                setPosition(undefined);
+                setUser(undefined);
+                setWalletIssue("This Freighter account is not connected to this site yet: click Connect Freighter.");
+                return;
+            }
             if (networkPassphrase !== NETWORK_PASSPHRASE) {
                 setWalletIssue("Freighter is on another network: switch it to Testnet.");
                 return;
@@ -554,6 +561,7 @@ function SendSharesForm({ user, position, onDone }: { user: string; position: Us
             <p className="muted small">
                 {worth !== undefined ? `Worth ${xlm(worth, 4)} XLM today. ` : ""}
                 The recipient keeps earning the yield and can withdraw it.
+                {to === "" && " Paste the recipient's address to send."}
                 {to !== "" && !validRecipient && " Enter another Stellar address."}
             </p>
 
