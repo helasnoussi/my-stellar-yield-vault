@@ -139,7 +139,7 @@ tmux kill-session -t agent  # stop it
 > A Blend pool can be misconfigured or exploited (for example the YieldBlox
 > pool drain of February 2026), so only approve pools you have reviewed.
 
-Never commit `.env` or expose `ADMIN_SECRET_KEY` or `AGENT_SECRET_KEY`.
+`.env`, `ADMIN_SECRET_KEY` and `AGENT_SECRET_KEY` are not commited.
 
 ---
 
