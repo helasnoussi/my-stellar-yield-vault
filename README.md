@@ -7,6 +7,8 @@ and the interest earned raises the value of every share. The contract confines
 the agent: it can only move funds between the vault and pools the admin has
 approved, never to an arbitrary address.
 
+🌐 **Live app (testnet):** [helasnoussi.github.io/my-stellar-yield-vault](https://helasnoussi.github.io/my-stellar-yield-vault/)
+
 🎬 **Demo video (3 min):** [youtu.be/wAgRSCXLDk4](https://youtu.be/wAgRSCXLDk4)
 
 ## 🚀 Features
