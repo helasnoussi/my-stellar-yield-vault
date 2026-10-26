@@ -269,9 +269,9 @@ follows account switches made in Freighter. To use it, import the admin's
 secret key (`stellar keys show <ADMIN_ALIAS>`, run outside any shared session)
 into Freighter as a separate account.
 
-## Built with
+## AI 
 
-Built with [Claude Code](https://claude.com/claude-code) and
+[Claude Code](https://claude.com/claude-code) and
 [Raven](https://raven.stellar.org), the Stellar ecosystem context server.
 Raven was used to pick Blend as the yield source, find its v2 contracts and
 interface, and review its risks (audits and the YieldBlox incident).
