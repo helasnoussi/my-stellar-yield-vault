@@ -7,6 +7,8 @@ and the interest earned raises the value of every share. The contract confines
 the agent: it can only move funds between the vault and pools the admin has
 approved, never to an arbitrary address.
 
+🎬 **Demo video (3 min):** [youtu.be/wAgRSCXLDk4](https://youtu.be/wAgRSCXLDk4)
+
 ## 🚀 Features
 
 - **Deposits and shares:** deposits go through the Stellar Asset Contract (SAC). A share is worth `total_assets / total_shares`, so interest accrues to depositors, and new depositors buy at the current price.
