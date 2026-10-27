@@ -9,7 +9,7 @@ approved, never to an arbitrary address.
 
 🌐 **Live app (testnet):** [helasnoussi.github.io/my-stellar-yield-vault](https://helasnoussi.github.io/my-stellar-yield-vault/)
 
-🎬 **Demo video (3 min):** [youtu.be/wAgRSCXLDk4](https://youtu.be/wAgRSCXLDk4)
+🎬 **Demo video (3 min):** https://youtu.be/wAgRSCXLDk4?is=ZnBtH0Uzn1C9rgKQ
 
 ## 🚀 Features
 
